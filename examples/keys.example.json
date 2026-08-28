@@ -1,0 +1,5 @@
+{
+  "sk-replace-me-machine-1": { "subject": "andrew", "label": "opencode" },
+  "sk-replace-me-machine-2": { "subject": "sam",    "label": "aider" },
+  "sk-replace-me-cron":      { "subject": null,     "label": "backup-script" }
+}
