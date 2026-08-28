@@ -1,0 +1,56 @@
+# Minimal: gateway in front of llama.cpp. Everything else is optional --
+# delete any service you do not want and its tools disappear from the model.
+name: llm-tools-gateway
+
+services:
+  gateway:
+    build: .
+    container_name: llm-tools-gateway
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    env_file: .env
+    volumes:
+      - ./workflows:/workflows:ro
+      - ./keys.json:/etc/llm-tools-gateway/keys.json:ro
+    depends_on: [llamacpp]
+
+  # ---- model server (swap for vLLM / Ollama / anything OpenAI-compatible) --
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llamacpp
+    restart: unless-stopped
+    volumes: ["./models:/models"]
+    command: >
+      --host 0.0.0.0 --port 8001
+      -m /models/your-model.gguf
+      -ngl 999 --ctx-size 32768 --jinja
+    # GPU passthrough differs by vendor; AMD/Vulkan example:
+    # devices: ["/dev/dri"]
+    # group_add: ["video","render"]
+
+  # ---- OPTIONAL: private web search ---------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes: ["./searxng:/etc/searxng"]
+    # settings.yml MUST enable the json format; SearXNG is HTML-only by default
+
+  # ---- OPTIONAL: memory + RAG ---------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg18-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: llm
+      POSTGRES_DB: llm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql        # pg18+ wants the PARENT dir
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+  embeddings:
+    build: ./embeddings
+    restart: unless-stopped
+    # CPU-only on purpose: keeps the GPU free for the model and image work
+
+volumes:
+  pgdata:

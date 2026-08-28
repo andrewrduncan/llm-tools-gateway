@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# llm-tools-gateway
+keys.json
+workflows/*.json
+!workflows/*.example.json
+models/
