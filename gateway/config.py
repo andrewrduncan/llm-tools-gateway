@@ -30,6 +30,11 @@ PROGRESS_HEARTBEAT = int(os.environ.get("PROGRESS_HEARTBEAT_SECONDS", "10"))
 # the client sets no sampling controls of its own.
 REPETITION_PENALTY = float(os.environ.get("DEFAULT_REPETITION_PENALTY", "1.1"))
 MIN_TEMPERATURE = float(os.environ.get("MIN_TEMPERATURE", "0.3"))
+# DRY penalises repeated multi-token SEQUENCES rather than single tokens, which is
+# the shape real loops take (a line or block cycling). llama.cpp only; ignored
+# elsewhere. Its own default look-back of 64 is too short to see a repeating block.
+DRY_MULTIPLIER = float(os.environ.get("DRY_MULTIPLIER", "0.8"))
+DRY_PENALTY_LAST_N = int(os.environ.get("DRY_PENALTY_LAST_N", "1024"))
 
 # ---- identity -------------------------------------------------------------
 KEYS_FILE = os.environ.get("KEYS_FILE", "/etc/llm-tools-gateway/keys.json")
@@ -43,6 +48,10 @@ SEARXNG_URL = os.environ.get("SEARXNG_URL", "").rstrip("/")
 PG_DSN = os.environ.get("PG_DSN", "")
 EMBED_URL = os.environ.get("EMBED_URL", "").rstrip("/")
 COMFY_URL = os.environ.get("COMFY_URL", "").rstrip("/")
+
+# Optional: bind-mount ComfyUI's output dir here and delete_image can remove the
+# generator's own copy too. Unset simply means that third copy is left alone.
+COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "")
 
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").rstrip("/")
 S3_BUCKET = os.environ.get("S3_BUCKET", "images")
@@ -73,4 +82,8 @@ def capabilities() -> dict:
         "storage":  bool(S3_ENDPOINT and S3_KEY_ID and S3_SECRET),
         "generate": bool(COMFY_URL) and wf(WORKFLOW_GENERATE),
         "edit":     bool(COMFY_URL) and wf(WORKFLOW_EDIT),
+        # deleting needs both halves: the object store holds the image, the
+        # index holds the row that makes it findable.
+        "delete":   bool(S3_ENDPOINT and S3_KEY_ID and S3_SECRET
+                         and PG_DSN and EMBED_URL),
     }

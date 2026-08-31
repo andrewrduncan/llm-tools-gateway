@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS files (
   url TEXT NOT NULL, content_type TEXT, bytes BIGINT,
   prompt TEXT, caption TEXT,
   embedding vector(768),             -- same space as text
+  source_file  TEXT,                    -- generator-side filename, so delete_image can clear every copy
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS files_vec  ON files USING hnsw (embedding vector_cosine_ops);

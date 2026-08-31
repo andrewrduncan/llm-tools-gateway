@@ -9,33 +9,51 @@ Client-supplied tools are passed through untouched and never executed here:
 only tools this gateway owns are run locally. That is what keeps opencode's
 file-editing tools working through the same endpoint.
 """
-import os, json, uuid, time, logging, asyncio
+import os, re, json, uuid, time, logging, asyncio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
-import tools as T
+from . import tools as T
 
-UPSTREAM = os.environ.get("VLLM_URL", "http://host.docker.internal:8001")
-KEYS_FILE = os.environ.get("KEYS_FILE", "/etc/llm-gateway/keys.json")
-# Stream progress notices while gateway tools run. Uses reasoning_content, which
-# clients RENDER but never EXECUTE -- unlike real tool_calls, which opencode would
-# try to run and choke on. Open WebUI shows it as a collapsible "Thinking" block.
-PROGRESS = os.environ.get("GATEWAY_PROGRESS", "1") not in ("0", "false", "")
-# Coding agents default to temperature 0. Greedy decoding can enter a token cycle
-# it cannot escape -- observed in opencode: the same paragraph repeated ~6 times
-# until the turn was killed. A small repetition penalty breaks the cycle with
-# negligible effect on determinism. Only applied when the client sets no
-# anti-repetition parameter of its own.
-REP_PENALTY = float(os.environ.get("DEFAULT_REPETITION_PENALTY", "1.1"))
-# Greedy decoding (temperature 0) CANNOT escape a repetition cycle -- if the top
-# token leads back to a prior state it re-enters deterministically, forever.
-# Coding agents default to 0 for reproducibility. A small floor gives the sampler
-# an escape route at negligible cost to determinism.
-MIN_TEMP = float(os.environ.get("MIN_TEMPERATURE", "0.3"))
-MAX_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "6"))
+# All deployment settings come from config.py -- server.py re-reading os.environ
+# duplicated those definitions and let the two drift apart.
+from .config import (UPSTREAM, KEYS_FILE, PROGRESS, MAX_TOOL_ROUNDS as MAX_ROUNDS,
+                     REPETITION_PENALTY as REP_PENALTY,
+                     MIN_TEMPERATURE as MIN_TEMP,
+                     DRY_MULTIPLIER, DRY_PENALTY_LAST_N as DRY_LAST_N)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
 app = FastAPI()
+
+
+
+IMG_MD = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)\)')
+
+
+def repair_image_urls(text, urls):
+    """Rewrite markdown image links to the URLs the tools actually returned.
+
+    Models retype image URLs instead of copying them, and corrupt them: observed
+    '.../img/gen/x.png' emitted as '...com.img/gen/x.png' with the key re-grouped.
+    The gateway knows the real URL, so it should not depend on the model
+    reproducing it. Links that already match are left alone.
+    """
+    if not urls:
+        return text
+    valid, pending = set(urls), list(urls)
+
+    def sub(m):
+        alt, got = m.group(1), m.group(2)
+        if got in valid:
+            return m.group(0)
+        repl = pending.pop(0) if pending else urls[-1]
+        log.info("repaired mangled image url: %s -> %s", got, repl)
+        return f"![{alt}]({repl})"
+    out = IMG_MD.sub(sub, text)
+    if not IMG_MD.search(out):          # tool made an image, model linked nothing
+        out = (out or "").rstrip() + "\n\n" + "".join(f"![generated image]({u})" for u in urls)
+    return out
 
 
 def is_internal_task(messages):
@@ -141,9 +159,19 @@ async def chat(request: Request):
     body = await request.json()
     subject, source = identify(request)
     if REP_PENALTY > 1.0 and not any(
-            k in body for k in ("repetition_penalty", "frequency_penalty",
-                                "presence_penalty")):
-        body["repetition_penalty"] = REP_PENALTY
+            k in body for k in ("repetition_penalty", "repeat_penalty",
+                                "frequency_penalty", "presence_penalty")):
+        # Engines disagree on the name and SILENTLY DROP the one they do not know:
+        # vLLM wants repetition_penalty, llama.cpp wants repeat_penalty. Sending
+        # only one spelling leaves the other engine with NO penalty at all, and
+        # repetition loops come straight back after an engine swap.
+        body["repetition_penalty"] = REP_PENALTY      # vLLM / TGI
+        body["repeat_penalty"] = REP_PENALTY          # llama.cpp
+        # DRY penalises repeated multi-token SEQUENCES, which is the real failure
+        # mode (a line pattern cycling), not single repeated tokens.
+        if DRY_MULTIPLIER > 0:
+            body.setdefault("dry_multiplier", DRY_MULTIPLIER)
+            body.setdefault("dry_penalty_last_n", DRY_LAST_N)
     if MIN_TEMP > 0 and float(body.get("temperature") or 0) < MIN_TEMP:
         body["temperature"] = MIN_TEMP
     stream = bool(body.pop("stream", False))
@@ -213,6 +241,13 @@ async def chat(request: Request):
             yield f"   {'done' if ok else 'FAILED'} in {dt:.1f}s\n"
             messages.append({"role": "tool", "tool_call_id": tc["id"],
                              "name": name, "content": text})
+            if name in ("generate_image", "edit_image"):
+                try:
+                    u = (json.loads(text) or {}).get("url")
+                    if u:
+                        turn_images.append(u)
+                except Exception:
+                    pass
             if img:
                 images.append(img)
         for im in images:
@@ -221,11 +256,21 @@ async def chat(request: Request):
                 {"type": "image_url",
                  "image_url": {"url": "data:image/png;base64," + im}}]})
 
+    turn_images = []   # image URLs produced this turn, for repair_image_urls
+
     async def apply(msg, tcs):
         """Append the assistant turn, run the tools, inject any screenshots."""
         messages.append({"role": "assistant", "content": msg.get("content"),
                          "tool_calls": tcs})
         tool_msgs, images = await execute(tcs, subject=subject, source=source)
+        for tm in tool_msgs:
+            if tm.get("name") in ("generate_image", "edit_image"):
+                try:
+                    u = (json.loads(tm.get("content") or "{}") or {}).get("url")
+                    if u:
+                        turn_images.append(u)
+                except Exception:
+                    pass
         messages.extend(tool_msgs)
         for img in images:
             messages.append({"role": "user", "content": [
@@ -242,11 +287,18 @@ async def chat(request: Request):
                 msg = data["choices"][0]["message"]
                 tcs = msg.get("tool_calls") or []
                 if not mine_only(tcs):
+                    if turn_images and not tcs:
+                        m0 = data["choices"][0]["message"]
+                        m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
                     return JSONResponse(data)
                 await apply(msg, tcs)
             body["messages"] = messages
             body["tool_choice"] = "none"
-            return JSONResponse(await call_upstream(client, body))
+            data = await call_upstream(client, body)
+            if turn_images:
+                m0 = data["choices"][0]["message"]
+                m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
+            return JSONResponse(data)
 
     # ---------------------------------------------------------- streaming
     async def gen():
@@ -292,7 +344,8 @@ async def chat(request: Request):
                             elif buf is not None:
                                 buf.append(d["content"])
                                 buf_len += len(d["content"])
-                                if buf_len >= FLUSH_AT:   # real answer, go live
+                                # hold everything if an image URL may need repairing
+                                if buf_len >= FLUSH_AT and not turn_images:
                                     for piece in buf:
                                         yield sse(chunk(cid, model, {"content": piece}))
                                     buf = None
@@ -316,8 +369,10 @@ async def chat(request: Request):
                             finish = ch["finish_reason"]
                 tcs = [acc_tcs[k] for k in sorted(acc_tcs)]
                 if not tcs and buf:
-                    for piece in buf:                      # real answer, flush it
-                        yield sse(chunk(cid, model, {"content": piece}))
+                    whole = "".join(buf)
+                    if turn_images:
+                        whole = repair_image_urls(whole, turn_images)
+                    yield sse(chunk(cid, model, {"content": whole}))
                 if not tcs:
                     yield sse(chunk(cid, model, {}, finish=finish))
                     if want_usage and usage_total:
@@ -349,7 +404,7 @@ async def chat(request: Request):
 async def serve_image(key: str):
     """Re-serve a Garage object. Garage has no anonymous access, so image URLs
     must come through here to be viewable in a browser / Open WebUI."""
-    import s3
+    from .backends import s3
     try:
         data, ctype = await s3.get(key)
     except Exception as e:
@@ -368,7 +423,7 @@ async def health():
 async def admin_index(request: Request):
     """Ingest a document for RAG. Not a model-facing tool -- an operator endpoint.
        {"uri": "...", "title": "...", "text": "...", "subject": null}"""
-    import memory as M
+    from . import memory as M
     b = await request.json()
     text = b.get("text", "")
     size = int(b.get("chunk_size", 1200))

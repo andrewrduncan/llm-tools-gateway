@@ -2,9 +2,9 @@
 title: Subject partitioning
 type: concept
 tags: [memory, multi-user, security]
-updated: 2026-08-28
-sources: [gateway/memory.py, schema.sql]
-verified_at: 2026-08-28
+updated: 2026-08-30
+sources: [gateway/memory.py, gateway/tools.py, schema.sql]
+verified_at: 2026-08-30
 ---
 
 # Subject partitioning
@@ -19,6 +19,28 @@ WHERE subject = :caller OR subject IS NULL
 ```
 
 Personal entries stay personal; `NULL` is shared with everyone.
+
+## Reading and deleting need different rules
+
+The read rule above is **wrong for destructive operations**. `OR subject IS NULL`
+makes shared rows visible to everyone, which is the point — but reused for a
+delete it makes shared rows *deletable* by everyone:
+
+```sql
+-- read  : subject matches OR the row is shared
+AND (subject IS NOT DISTINCT FROM :caller OR subject IS NULL)
+-- write : subject must match exactly
+AND subject IS NOT DISTINCT FROM :caller
+```
+
+`find_file(ref, subject, for_write=False)` takes a flag for exactly this reason
+(`gateway/memory.py`). Shared images stay viewable by anyone and deletable only by
+whoever created them.
+
+This was a real defect, not a hypothetical: `delete_image` initially reused the
+read predicate, and a caller identifying as a different subject successfully
+deleted a shared image. Any partitioned store that grows a delete path inherits
+this trap — the read rule is the natural thing to reach for and it is the wrong one.
 
 ## Identity: two mechanisms, deliberately separate
 

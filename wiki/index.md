@@ -1,7 +1,7 @@
 ---
 title: Index
 type: index
-updated: 2026-08-28
+updated: 2026-08-31
 ---
 
 # Index
@@ -20,6 +20,8 @@ updated: 2026-08-28
 - [tool-ownership-split](concepts/tool-ownership-split.md) — whose tool is it
 - [subject-partitioning](concepts/subject-partitioning.md) — multi-user memory
 - [bandwidth-bound-decode](concepts/bandwidth-bound-decode.md) — what sets local tok/s
+- [image-lifecycle](concepts/image-lifecycle.md) — three copies, opaque keys, unauthenticated serving
+- [engine-parameter-dialects](concepts/engine-parameter-dialects.md) — silently dropped sampling params
 
 ## Analyses
 - [engine-choice](analyses/engine-choice.md) — vLLM vs llama.cpp, with measurements

@@ -138,7 +138,7 @@ async def search_documents(query, subject=None, limit=5):
 
 # ------------------------------------------------------------------ files
 async def index_file(bucket, key, url, content_type, size, prompt=None,
-                     caption=None, subject=None, image_b64=None):
+                     caption=None, subject=None, image_b64=None, source_file=None):
     emb = None
     if image_b64:
         emb = _vec((await embed_image_b64([image_b64]))[0])
@@ -147,11 +147,11 @@ async def index_file(bucket, key, url, content_type, size, prompt=None,
     p = await pool()
     row = await p.fetchrow(
         """INSERT INTO files (subject,bucket,object_key,url,content_type,bytes,
-                              prompt,caption,embedding)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector)
+                              prompt,caption,embedding,source_file)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector,$10)
            ON CONFLICT (object_key) DO UPDATE SET url=EXCLUDED.url
            RETURNING id""",
-        subject, bucket, key, url, content_type, size, prompt, caption, emb)
+        subject, bucket, key, url, content_type, size, prompt, caption, emb, source_file)
     return {"id": row["id"], "url": url}
 
 
@@ -171,3 +171,32 @@ async def search_images(query, subject=None, limit=6):
          "when": r["created_at"].strftime("%Y-%m-%d"),
          "markdown": f"![{(r['prompt'] or 'image')[:60]}]({r['url']})"}
         for r in rows]}
+
+
+async def find_file(ref, subject=None, for_write=False):
+    """Resolve a url / object_key / bare filename to one indexed file row.
+
+    Read and write deliberately use DIFFERENT partition rules:
+      read  -- subject matches OR the row is shared (NULL), same rule as recall
+      write -- subject must match EXACTLY. Shared rows stay readable by everyone
+               but are deletable only by whoever created them; reusing the read
+               rule here would let any caller destroy shared content.
+    """
+    p = await pool()
+    if for_write:
+        cond, args = "AND subject IS NOT DISTINCT FROM $2", (ref, subject)
+    else:
+        cond, args = "AND (subject IS NOT DISTINCT FROM $2 OR subject IS NULL)", (ref, subject)
+    return await p.fetchrow(
+        f"""SELECT id, object_key, url, source_file, prompt, subject
+             FROM files
+            WHERE (object_key = $1 OR url = $1 OR url LIKE '%' || $1
+                   OR source_file = $1)
+              {cond}
+            ORDER BY id DESC LIMIT 1""",
+        *args)
+
+
+async def forget_file(row_id):
+    p = await pool()
+    await p.execute("DELETE FROM files WHERE id = $1", row_id)
