@@ -1,16 +1,28 @@
 """Server-side tools exposed to every client of the gateway."""
-import os, json, base64, datetime, asyncio
+import os, json, base64, datetime, asyncio, secrets
 from zoneinfo import ZoneInfo
 import httpx
 from . import memory as M
 from .backends import s3
 
 from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
-                     PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR,
+                     PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR, COMFY_OUTPUT_DIR,
                      WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
 # compose service name, or images render as broken links.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+
+# Image keys must be BOTH unguessable and easy for a model to copy verbatim.
+# uuid4 satisfied the first and failed the second: models retype the URL instead
+# of copying it and re-group the hyphens (observed: 37980a9e-764e-4990... emitted
+# as 3798-0a9e-764-e499-...), producing a dead link. Lowercase alphanumerics only.
+_KEY_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"   # no l/o/0/1 lookalikes
+
+
+def _img_key(prefix: str) -> str:
+    return f"{prefix}/{''.join(secrets.choice(_KEY_ALPHABET) for _ in range(16))}.png"
+
 
 # ---------------------------------------------------------------- definitions
 DEFS = [
@@ -120,6 +132,16 @@ DEFS = [
             "limit": {"type": "integer", "description": "Default 6."}},
             "required": ["query"]}}},
     {"type": "function", "function": {
+        "name": "delete_image",
+        "description": "Permanently delete a generated image. Removes every copy: the stored "
+                       "object (so its public URL stops resolving), the search index entry, and "
+                       "the generator's output file. Use search_images first if the user refers "
+                       "to an image without giving a URL. This cannot be undone.",
+        "parameters": {"type": "object", "properties": {
+            "image": {"type": "string",
+                      "description": "The image URL, object key, or filename to delete."}},
+            "required": ["image"]}}},
+    {"type": "function", "function": {
         "name": "edit_image",
         "description": "Edit an EXISTING image using a natural-language instruction "
                        "(change colours, replace objects, alter style/lighting, remove or "
@@ -141,7 +163,7 @@ NAMES = {d["function"]["name"] for d in DEFS}
 # Tools whose caller identity must be injected server-side. The model must NEVER
 # be able to set `subject` -- otherwise it could read another user's memories.
 SUBJECT_TOOLS = {"remember", "recall", "forget", "search_documents",
-                 "search_images", "generate_image", "edit_image"}
+                 "search_images", "generate_image", "edit_image", "delete_image"}
 
 # ---------------------------------------------------------------- helpers
 def _clean_html(html: str, max_chars: int) -> str:
@@ -263,11 +285,11 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
                 try:
                     # Durable object storage: a ComfyUI /view URL dies when its
                     # output dir is cleaned, silently breaking old chat images.
-                    key = f"gen/{sd}-{w}x{h}-{fn}"
+                    key = _img_key("gen")
                     url = await s3.put(key, raw, "image/png")
                     import base64
                     await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
-                                       prompt=prompt, subject=subject,
+                                       prompt=prompt, subject=subject, source_file=fn,
                                        image_b64=base64.b64encode(raw).decode())
                 except Exception as e:
                     log_err = f"{type(e).__name__}: {e}"
@@ -379,10 +401,10 @@ async def edit_image(image_url: str, instruction: str, steps: int = 4,
                 raw = (await c.get(f"{COMFY}/view",
                                    params={"filename": fn, "type": "output"})).content
                 import base64
-                key = f"edit/{sd}-{fn}"
+                key = _img_key("edit")
                 url = await s3.put(key, raw, "image/png")
                 await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
-                                   prompt=f"[edit] {instruction}", subject=subject,
+                                   prompt=f"[edit] {instruction}", subject=subject, source_file=fn,
                                    image_b64=base64.b64encode(raw).decode())
                 return json.dumps({
                     "status": "ok", "url": url, "seed": sd, "steps": st,
@@ -394,11 +416,46 @@ async def edit_image(image_url: str, instruction: str, steps: int = 4,
         return json.dumps({"error": "timed out"})
 
 
+
+async def delete_image(image: str, subject=None):
+    """Delete an image everywhere it exists.
+
+    Partial failures are reported rather than swallowed: an object that is gone
+    but still indexed leaves a dangling search result pointing at a dead URL.
+    """
+    row = await M.find_file(image, subject, for_write=True)
+    if not row:
+        return json.dumps({"status": "not_found",
+                           "note": f"No image you own matches {image!r}. Shared images are "
+                                   f"viewable by anyone but deletable only by their creator."})
+    removed, failed = [], []
+    try:
+        await s3.delete(row["object_key"]); removed.append("object storage")
+    except Exception as e:
+        failed.append(f"object storage: {type(e).__name__}: {e}")
+    try:
+        await M.forget_file(row["id"]); removed.append("search index")
+    except Exception as e:
+        failed.append(f"search index: {type(e).__name__}: {e}")
+    if COMFY_OUTPUT_DIR and row["source_file"]:
+        p = os.path.join(COMFY_OUTPUT_DIR, os.path.basename(row["source_file"]))
+        try:
+            if os.path.exists(p):
+                os.remove(p); removed.append("generator output")
+        except Exception as e:
+            failed.append(f"generator output: {type(e).__name__}: {e}")
+    return json.dumps({"status": "ok" if not failed else "partial",
+                       "deleted_from": removed, "errors": failed,
+                       "prompt": row["prompt"],
+                       "note": "The image is gone and its URL no longer resolves."})
+
+
 DISPATCH = {"get_current_datetime": get_current_datetime, "web_search": web_search,
             "fetch_url": fetch_url, "browse_page": browse_page,
             "generate_image": generate_image, "edit_image": edit_image,
             "remember": remember, "recall": recall, "forget": forget,
-            "search_documents": search_documents, "search_images": search_images}
+            "search_documents": search_documents, "search_images": search_images,
+            "delete_image": delete_image}
 
 # image generation legitimately takes ~40s+; the default 90s cap is too tight
 TIMEOUTS = {"generate_image": 330, "edit_image": 700}

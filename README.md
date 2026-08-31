@@ -55,6 +55,7 @@ model is offered only what can actually run.
 | `search_documents` (RAG) | `PG_DSN` + `EMBED_URL` | hidden |
 | `generate_image` / `edit_image` | `COMFY_URL` + a workflow | hidden |
 | `search_images` | above + `S3_*` | hidden |
+| `delete_image` | `PG_DSN` + `EMBED_URL` + `S3_*` | hidden |
 
 Run it with nothing but `UPSTREAM_URL` and you still get date/time and URL
 fetching. Nobody sees a broken tool.

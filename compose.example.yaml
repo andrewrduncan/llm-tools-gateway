@@ -12,6 +12,9 @@ services:
     volumes:
       - ./workflows:/workflows:ro
       - ./keys.json:/etc/llm-tools-gateway/keys.json:ro
+      # optional, rw: lets delete_image remove ComfyUI's own copy of an image.
+      # Without it delete_image still clears the object store and the index.
+      - ./comfyui/output:/comfy-output
     depends_on: [llamacpp]
 
   # ---- model server (swap for vLLM / Ollama / anything OpenAI-compatible) --
