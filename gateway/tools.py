@@ -6,6 +6,7 @@ from . import memory as M
 from .backends import s3
 
 from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
+                     COMFY_PUBLIC_URL as COMFY_PUB,
                      PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR, COMFY_OUTPUT_DIR,
                      WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
