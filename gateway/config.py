@@ -64,6 +64,31 @@ S3_KEY_ID = os.environ.get("S3_KEY_ID", "")
 S3_SECRET = os.environ.get("S3_SECRET", "")
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 
+# ---- private / ephemeral mode ---------------------------------------------
+# Nothing generated in a private turn is written down: no object storage, no
+# index row, no embedding, no memory. The image comes back inline in the
+# transcript and disappears with it.
+#
+# Open WebUI marks a Temporary Chat with a chat id prefixed "temporary:" (older
+# builds used "local:"), so its own toggle drives this with no extra UI. Clients
+# with no such concept opt in with {"private": true} or a model name ending in
+# PRIVATE_MODEL_SUFFIX.
+PRIVATE_CHAT_ID_PREFIXES = tuple(p.strip() for p in os.environ.get(
+    "PRIVATE_CHAT_ID_PREFIXES", "temporary:,local:").split(",") if p.strip())
+PRIVATE_MODEL_SUFFIX = os.environ.get("PRIVATE_MODEL_SUFFIX", "-private")
+
+# Withheld in private mode: every tool that reads or writes durable state. The
+# model is never offered them, so it cannot leak into or out of the session.
+PRIVATE_DISABLED_TOOLS = {t.strip() for t in os.environ.get(
+    "PRIVATE_DISABLED_TOOLS",
+    "remember,forget,recall,search_documents,search_images,delete_image"
+).split(",") if t.strip()}
+
+# An inline image lives in the context window, so size matters far more than it
+# does for a stored one: a 1024x1024 PNG is ~1.5 MB and base64 adds a third.
+PRIVATE_IMAGE_FORMAT = os.environ.get("PRIVATE_IMAGE_FORMAT", "WEBP").upper()
+PRIVATE_IMAGE_QUALITY = int(os.environ.get("PRIVATE_IMAGE_QUALITY", "80"))
+
 DEFAULT_TZ = os.environ.get("DEFAULT_TZ", "UTC")
 PLAYWRIGHT = _b("ENABLE_BROWSER", "1")
 
