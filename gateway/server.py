@@ -154,11 +154,41 @@ def chunk(cid, model, delta, finish=None):
                                          "finish_reason": finish}]}
 
 
+# Anti-loop penalties and verbatim quotation are in direct conflict. DRY
+# penalises repeated multi-token SEQUENCES -- but copying "October 06, 2026" out
+# of a tool result IS a repeated sequence, so DRY suppresses the correct tokens
+# and the model substitutes plausible-looking ones from its training prior.
+# Measured on Qwen3-VL-30B asked to restate a date supplied by get_current_datetime:
+#   no penalties .................... 3/3 correct
+#   repetition_penalty 1.1 .......... 3/4 correct
+#   DRY (any dry_penalty_last_n) .... 0/4 correct  -- invented 2023, 2024, 2021
+# Shrinking the look-back does not help: the quoted text is only tens of tokens
+# back, so any useful window still covers it. The only fix is not to apply these
+# once the turn contains material the model is supposed to reproduce exactly.
+_ANTI_LOOP_KEYS = ("repetition_penalty", "repeat_penalty",
+                   "dry_multiplier", "dry_penalty_last_n")
+
+
+def has_tool_results(messages) -> bool:
+    """True once this turn carries tool output the model must quote faithfully."""
+    for m in messages or []:
+        if m.get("role") == "tool" or m.get("tool_calls"):
+            return True
+    return False
+
+
+def drop_anti_loop(body):
+    """Remove anti-loop sampling so tool output can be reproduced verbatim."""
+    for k in _ANTI_LOOP_KEYS:
+        body.pop(k, None)
+    return body
+
+
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     body = await request.json()
     subject, source = identify(request)
-    if REP_PENALTY > 1.0 and not any(
+    if REP_PENALTY > 1.0 and not has_tool_results(body.get("messages")) and not any(
             k in body for k in ("repetition_penalty", "repeat_penalty",
                                 "frequency_penalty", "presence_penalty")):
         # Engines disagree on the name and SILENTLY DROP the one they do not know:
@@ -214,6 +244,9 @@ async def chat(request: Request):
         client sees up to ~45s of total silence during image generation."""
         messages.append({"role": "assistant", "content": msg.get("content"),
                          "tool_calls": tcs})
+        # From here the turn carries tool output the model must quote exactly,
+        # so the anti-loop penalties have to come off (see _ANTI_LOOP_KEYS).
+        drop_anti_loop(body)
         images = []
         for tc in tcs:
             fn = tc["function"]
@@ -262,6 +295,9 @@ async def chat(request: Request):
         """Append the assistant turn, run the tools, inject any screenshots."""
         messages.append({"role": "assistant", "content": msg.get("content"),
                          "tool_calls": tcs})
+        # From here the turn carries tool output the model must quote exactly,
+        # so the anti-loop penalties have to come off (see _ANTI_LOOP_KEYS).
+        drop_anti_loop(body)
         tool_msgs, images = await execute(tcs, subject=subject, source=source)
         for tm in tool_msgs:
             if tm.get("name") in ("generate_image", "edit_image"):
