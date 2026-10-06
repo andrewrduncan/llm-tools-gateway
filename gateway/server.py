@@ -20,7 +20,9 @@ from . import tools as T
 from .config import (UPSTREAM, KEYS_FILE, PROGRESS, MAX_TOOL_ROUNDS as MAX_ROUNDS,
                      REPETITION_PENALTY as REP_PENALTY,
                      MIN_TEMPERATURE as MIN_TEMP,
-                     DRY_MULTIPLIER, DRY_PENALTY_LAST_N as DRY_LAST_N)
+                     DRY_MULTIPLIER, DRY_PENALTY_LAST_N as DRY_LAST_N,
+                     PRIVATE_CHAT_ID_PREFIXES, PRIVATE_MODEL_SUFFIX,
+                     PRIVATE_DISABLED_TOOLS)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -112,10 +114,55 @@ def identify(request):
     return None, "anonymous"
 
 
-def merge_tools(client_tools):
-    """Client tools win on name collision; ours are appended."""
+def is_private(body) -> bool:
+    """Should this turn leave no trace?
+
+    Open WebUI's own Temporary Chat toggle is the primary trigger: it prefixes
+    the chat id with "temporary:" and never saves the conversation. Honouring
+    that prefix makes the whole stack agree on what private means, instead of
+    asking the user to remember a second switch.
+    """
+    if body.get("private") is True:
+        return True
+    cid = str(body.get("chat_id")
+              or (body.get("metadata") or {}).get("chat_id") or "")
+    if cid and PRIVATE_CHAT_ID_PREFIXES and cid.startswith(PRIVATE_CHAT_ID_PREFIXES):
+        return True
+    if PRIVATE_MODEL_SUFFIX and str(body.get("model") or "").endswith(PRIVATE_MODEL_SUFFIX):
+        return True
+    return False
+
+
+def image_label(tool_name: str) -> str:
+    return ("Screenshot from browse_page:" if tool_name == "browse_page"
+            else f"Image produced by {tool_name}:")
+
+
+def inject_images(messages, images):
+    """Attach tool-produced images so a vision model can actually see them."""
+    for label, b64, mime in images:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": label},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]})
+
+
+def as_image(img, tool_name):
+    """Normalise a tool's image return into (label, base64, mime)."""
+    b64, mime = img if isinstance(img, tuple) else (img, "image/png")
+    return image_label(tool_name), b64, mime
+
+
+def merge_tools(client_tools, private=False):
+    """Client tools win on name collision; ours are appended.
+
+    In a private turn the persistence tools are not offered at all. Withholding
+    them beats instructing the model not to use them: it cannot call what it
+    cannot see.
+    """
     names = {t.get("function", {}).get("name") for t in (client_tools or [])}
-    return list(client_tools or []) + [d for d in T.DEFS
+    ours = [d for d in T.DEFS
+            if not (private and d["function"]["name"] in PRIVATE_DISABLED_TOOLS)]
+    return list(client_tools or []) + [d for d in ours
                                        if d["function"]["name"] not in names]
 
 
@@ -126,7 +173,7 @@ async def call_upstream(client, body):
     return r.json()
 
 
-async def execute(tool_calls, subject=None, source=None):
+async def execute(tool_calls, subject=None, source=None, private=False):
     """Run our tools. Returns (tool_messages, images_to_inject)."""
     msgs, images = [], []
     for tc in tool_calls:
@@ -135,12 +182,14 @@ async def execute(tool_calls, subject=None, source=None):
             args = json.loads(fn.get("arguments") or "{}")
         except Exception:
             args = {}
-        log.info("tool: %s(%s) [subject=%s]", fn["name"], json.dumps(args)[:140], subject)
-        text, img = await T.run(fn["name"], args, subject=subject, source=source)
+        log.info("tool: %s(%s) [subject=%s%s]", fn["name"], json.dumps(args)[:140],
+                 subject, " PRIVATE" if private else "")
+        text, img = await T.run(fn["name"], args, subject=subject, source=source,
+                                private=private)
         msgs.append({"role": "tool", "tool_call_id": tc["id"],
                      "name": fn["name"], "content": text})
         if img:
-            images.append(img)
+            images.append(as_image(img, fn["name"]))
     return msgs, images
 
 
@@ -188,6 +237,12 @@ def drop_anti_loop(body):
 async def chat(request: Request):
     body = await request.json()
     subject, source = identify(request)
+    private = is_private(body)
+    body.pop("private", None)          # our flag, not an upstream parameter
+    if private:
+        log.info("PRIVATE turn [subject=%s chat_id=%s] -- no storage, no memory tools",
+                 subject, body.get("chat_id")
+                 or (body.get("metadata") or {}).get("chat_id"))
     if REP_PENALTY > 1.0 and not has_tool_results(body.get("messages")) and not any(
             k in body for k in ("repetition_penalty", "repeat_penalty",
                                 "frequency_penalty", "presence_penalty")):
@@ -207,7 +262,7 @@ async def chat(request: Request):
     stream = bool(body.pop("stream", False))
     want_usage = bool((body.pop("stream_options", None) or {}).get("include_usage"))
     client_tools = body.get("tools")
-    body["tools"] = merge_tools(client_tools)
+    body["tools"] = merge_tools(client_tools, private=private)
     if not body.get("tool_choice"):
         body["tool_choice"] = "auto"
     if is_internal_task(body.get("messages")):
@@ -257,12 +312,14 @@ async def chat(request: Request):
                 args = {}
             icon = ICONS.get(name, "\U0001F527")
             yield f"{icon} {name}({_brief(args)})\n"
-            log.info("tool: %s(%s) [subject=%s]", name, json.dumps(args)[:140], subject)
+            log.info("tool: %s(%s) [subject=%s%s]", name, json.dumps(args)[:140],
+                     subject, " PRIVATE" if private else "")
             t0 = time.time()
             # Run the tool as a task so we can emit heartbeats while it works.
             # generate_image takes ~50s; without this the client goes silent and
             # the user cannot tell "working" from "hung".
-            task = asyncio.create_task(T.run(name, args, subject=subject, source=source))
+            task = asyncio.create_task(T.run(name, args, subject=subject,
+                                             source=source, private=private))
             while True:
                 done, _ = await asyncio.wait({task}, timeout=10)
                 if done:
@@ -282,12 +339,8 @@ async def chat(request: Request):
                 except Exception:
                     pass
             if img:
-                images.append(img)
-        for im in images:
-            messages.append({"role": "user", "content": [
-                {"type": "text", "text": "Screenshot from browse_page:"},
-                {"type": "image_url",
-                 "image_url": {"url": "data:image/png;base64," + im}}]})
+                images.append(as_image(img, name))
+        inject_images(messages, images)
 
     turn_images = []   # image URLs produced this turn, for repair_image_urls
 
@@ -298,7 +351,8 @@ async def chat(request: Request):
         # From here the turn carries tool output the model must quote exactly,
         # so the anti-loop penalties have to come off (see _ANTI_LOOP_KEYS).
         drop_anti_loop(body)
-        tool_msgs, images = await execute(tcs, subject=subject, source=source)
+        tool_msgs, images = await execute(tcs, subject=subject, source=source,
+                                          private=private)
         for tm in tool_msgs:
             if tm.get("name") in ("generate_image", "edit_image"):
                 try:
@@ -308,11 +362,7 @@ async def chat(request: Request):
                 except Exception:
                     pass
         messages.extend(tool_msgs)
-        for img in images:
-            messages.append({"role": "user", "content": [
-                {"type": "text", "text": "Screenshot from browse_page:"},
-                {"type": "image_url",
-                 "image_url": {"url": "data:image/png;base64," + img}}]})
+        inject_images(messages, images)
 
     # ---------------------------------------------------------- non-streaming
     if not stream:

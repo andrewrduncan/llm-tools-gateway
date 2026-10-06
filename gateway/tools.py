@@ -8,7 +8,8 @@ from .backends import s3
 from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
                      COMFY_PUBLIC_URL as COMFY_PUB,
                      PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR, COMFY_OUTPUT_DIR,
-                     WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities)
+                     WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities,
+                     PRIVATE_IMAGE_FORMAT, PRIVATE_IMAGE_QUALITY)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
 # compose service name, or images render as broken links.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
@@ -166,7 +167,36 @@ NAMES = {d["function"]["name"] for d in DEFS}
 SUBJECT_TOOLS = {"remember", "recall", "forget", "search_documents",
                  "search_images", "generate_image", "edit_image", "delete_image"}
 
+# Tools whose behaviour changes in a private turn: they must not persist.
+PRIVATE_AWARE_TOOLS = {"generate_image", "edit_image"}
+
 # ---------------------------------------------------------------- helpers
+def _inline_image(raw: bytes):
+    """Re-encode for inclusion in the transcript and return (data_uri_b64, mime).
+
+    A stored image is fetched once by the browser; an inline one lives in the
+    context window and is re-sent on every subsequent turn, so the size of this
+    payload is a running cost rather than a one-off.
+    """
+    fmt = PRIVATE_IMAGE_FORMAT or "WEBP"
+    try:
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(raw))
+        if fmt in ("JPEG", "JPG") and img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        buf = _io.BytesIO()
+        img.save(buf, format=fmt, quality=PRIVATE_IMAGE_QUALITY)
+        out = buf.getvalue()
+        # Only keep the re-encode if it actually helped.
+        if len(out) < len(raw):
+            return base64.b64encode(out).decode(), f"image/{fmt.lower()}"
+    except Exception:
+        pass   # Pillow missing or format unsupported -- fall back to the original
+    return base64.b64encode(raw).decode(), "image/png"
+
+
+
 def _clean_html(html: str, max_chars: int) -> str:
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "lxml")
@@ -243,7 +273,7 @@ async def browse_page(url: str, screenshot: bool = False, full_page: bool = Fals
                        "screenshot_attached": bool(shot_b64)}, ensure_ascii=False), shot_b64
 
 async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
-                         seed: int = None, subject=None) -> str:
+                         seed: int = None, subject=None, private: bool = False) -> str:
     """Drive ComfyUI's API. Mirrors the verified Qwen-Image + Lightning workflow."""
     w = max(256, min(int(width or 1024), 1536))
     h = max(256, min(int(height or 1024), 1536))
@@ -282,6 +312,23 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
                 fn = imgs[0]["filename"]
                 raw = (await c.get(f"{COMFY}/view",
                                    params={"filename": fn, "type": "output"})).content
+                if private:
+                    # Nothing is written down: no object, no index row, no
+                    # embedding. The image is handed back inline and lives only
+                    # in the transcript. Remove the generator's own copy too --
+                    # ComfyUI writes it to disk before we ever see it.
+                    b64, mime = _inline_image(raw)
+                    if COMFY_OUTPUT_DIR:
+                        try:
+                            os.remove(os.path.join(COMFY_OUTPUT_DIR, os.path.basename(fn)))
+                        except OSError:
+                            pass
+                    return json.dumps({
+                        "status": "ok", "seed": sd, "size": f"{w}x{h}",
+                        "private": True,
+                        "note": "Private turn: the image is attached to this "
+                                "conversation only. It was not stored and has no "
+                                "URL. Describe it; do not invent a link."}), (b64, mime)
                 url = f"{COMFY_PUB}/view?filename={fn}&type=output"   # fallback
                 try:
                     # Durable object storage: a ComfyUI /view URL dies when its
@@ -461,9 +508,13 @@ DISPATCH = {"get_current_datetime": get_current_datetime, "web_search": web_sear
 # image generation legitimately takes ~40s+; the default 90s cap is too tight
 TIMEOUTS = {"generate_image": 330, "edit_image": 700}
 
-async def run(name: str, args: dict, subject=None, source=None):
+async def run(name: str, args: dict, subject=None, source=None, private=False):
     """Execute a server tool. Returns (text, optional_image_b64)."""
     fn = DISPATCH[name]
+    if name in PRIVATE_AWARE_TOOLS:
+        # SECURITY: like subject, this comes from the request, never the model.
+        args.pop("private", None)
+        args["private"] = private
     if name in SUBJECT_TOOLS:
         # SECURITY: identity comes from the request, never from the model.
         args.pop("subject", None)
