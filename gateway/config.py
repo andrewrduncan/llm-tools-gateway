@@ -86,7 +86,14 @@ PRIVATE_DISABLED_TOOLS = {t.strip() for t in os.environ.get(
 
 # An inline image lives in the context window, so size matters far more than it
 # does for a stored one: a 1024x1024 PNG is ~1.5 MB and base64 adds a third.
-PRIVATE_IMAGE_FORMAT = os.environ.get("PRIVATE_IMAGE_FORMAT", "WEBP").upper()
+#
+# The format has to be decodable by the MODEL SERVER's vision stack, not just by
+# the browser -- the image is fed back to the model as well as rendered. WEBP is
+# the obvious choice on size and every browser reads it, but llama.cpp decodes
+# images with stb_image, which has no WebP support, and rejects the request with
+# "mtmd_helper_bitmap_init_from_buf: failed to decode webp buffer". Stick to
+# JPEG or PNG unless you know your backend handles more.
+PRIVATE_IMAGE_FORMAT = os.environ.get("PRIVATE_IMAGE_FORMAT", "JPEG").upper()
 PRIVATE_IMAGE_QUALITY = int(os.environ.get("PRIVATE_IMAGE_QUALITY", "80"))
 
 DEFAULT_TZ = os.environ.get("DEFAULT_TZ", "UTC")
