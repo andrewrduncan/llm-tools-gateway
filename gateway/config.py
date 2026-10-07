@@ -58,6 +58,14 @@ COMFY_PUBLIC_URL = os.environ.get("COMFY_PUBLIC_URL", COMFY_URL).rstrip("/")
 # generator's own copy too. Unset simply means that third copy is left alone.
 COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "")
 
+# Bind-mount ComfyUI's INPUT dir here so an edit can remove its own source image.
+# That source is the user's upload: working data, never indexed and never put in
+# object storage, and it should not outlive the job that needed it. Without this
+# every edited image accumulates in ComfyUI's input directory forever.
+COMFY_INPUT_DIR = os.environ.get("COMFY_INPUT_DIR", "")
+# Safety net for sources orphaned by a crash between upload and cleanup.
+COMFY_INPUT_TTL = int(os.environ.get("COMFY_INPUT_TTL", "900"))
+
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").rstrip("/")
 S3_BUCKET = os.environ.get("S3_BUCKET", "images")
 S3_KEY_ID = os.environ.get("S3_KEY_ID", "")

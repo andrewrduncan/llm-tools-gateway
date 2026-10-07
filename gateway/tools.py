@@ -9,7 +9,8 @@ from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
                      COMFY_PUBLIC_URL as COMFY_PUB,
                      PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR, COMFY_OUTPUT_DIR,
                      WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities,
-                     PRIVATE_IMAGE_FORMAT, PRIVATE_IMAGE_QUALITY)
+                     PRIVATE_IMAGE_FORMAT, PRIVATE_IMAGE_QUALITY,
+                     COMFY_INPUT_DIR, COMFY_INPUT_TTL)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
 # compose service name, or images render as broken links.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
@@ -171,6 +172,43 @@ SUBJECT_TOOLS = {"remember", "recall", "forget", "search_documents",
 PRIVATE_AWARE_TOOLS = {"generate_image", "edit_image"}
 
 # ---------------------------------------------------------------- helpers
+def _drop_edit_source(fname: str):
+    """Delete an edit's uploaded source once the job no longer needs it.
+
+    The source is the user's own upload. It is never indexed and never stored,
+    so leaving it in ComfyUI's input directory is pure residue -- and in a
+    private turn it is residue of something that was supposed to leave no trace.
+    """
+    if not (COMFY_INPUT_DIR and fname):
+        return
+    # fname is a LoadImage reference like "edit-src-123.png [temp]"
+    base = os.path.basename(fname.split(" [")[0])
+    try:
+        os.remove(os.path.join(COMFY_INPUT_DIR, base))
+    except OSError:
+        pass
+
+
+def _sweep_edit_sources(older_than: int = None):
+    """Remove sources orphaned by a crash between upload and cleanup."""
+    if not COMFY_INPUT_DIR:
+        return
+    import time as _t
+    cutoff = _t.time() - (older_than if older_than is not None else COMFY_INPUT_TTL)
+    try:
+        for n in os.listdir(COMFY_INPUT_DIR):
+            if not n.startswith("edit-src-"):
+                continue
+            p = os.path.join(COMFY_INPUT_DIR, n)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _to_websocket_output(wf: dict) -> dict:
     """Swap a workflow's disk-writing output node for the websocket one.
 
@@ -439,17 +477,27 @@ async def search_images(query, limit=6, subject=None):
 
 
 async def _comfy_upload(client, raw: bytes, name: str) -> str:
-    """Push bytes into ComfyUI's input dir so LoadImage can reference them."""
+    """Push bytes into ComfyUI's TEMP dir and return a LoadImage reference.
+
+    temp rather than input, because an edit source is working data that should
+    not outlive the job. ComfyUI owns its temp directory and clears it on
+    startup, so a source survives a gateway crash by at most one restart -- and
+    with the temp dir mounted as tmpfs it was never on disk to begin with.
+    LoadImage addresses non-input files as "<name> [temp]".
+    """
     r = await client.post(f"{COMFY}/upload/image",
                           files={"image": (name, raw, "image/png")},
-                          data={"overwrite": "true"})
+                          data={"overwrite": "true", "type": "temp"})
     r.raise_for_status()
     j = r.json()
-    return j.get("name", name)
+    nm = j.get("name", name)
+    sub = j.get("subfolder") or ""
+    ref = f"{sub}/{nm}" if sub else nm
+    return f"{ref} [temp]" if (j.get("type") or "temp") == "temp" else ref
 
 
 async def edit_image(image_url: str, instruction: str, steps: int = 4,
-                     seed: int = None, subject=None) -> str:
+                     seed: int = None, subject=None, private: bool = False) -> str:
     """Mirrors ComfyUI's official image_qwen_image_edit_2509 template. Every node
     here matters -- an earlier hand-rolled version omitted ModelSamplingAuraFlow
     and CFGNorm and produced a faithful COPY of the input with the instruction
@@ -463,6 +511,7 @@ async def edit_image(image_url: str, instruction: str, steps: int = 4,
                 return json.dumps({"error": f"source image invalid ({len(src)} bytes)"})
         except Exception as e:
             return json.dumps({"error": f"could not fetch image_url: {type(e).__name__}: {e}"})
+        _sweep_edit_sources()      # clear anything a previous crash orphaned
         fname = await _comfy_upload(c, src, f"edit-src-{sd}.png")
 
         wf = {
@@ -494,8 +543,25 @@ async def edit_image(image_url: str, instruction: str, steps: int = 4,
           "13":{"class_type":"VAEDecode","inputs":{"samples":["12",0],"vae":["6",0]}},
           "14":{"class_type":"SaveImage","inputs":{"filename_prefix":"edit","images":["13",0]}},
         }
+        if private:
+            # Same guarantee as generate_image: the result never reaches a
+            # filesystem. The uploaded source had to, because LoadImage has no
+            # base64 variant -- it goes to ComfyUI's temp dir (tmpfs) and is
+            # removed the moment the job is done.
+            raw, err = await _comfy_generate_ws(_to_websocket_output(wf))
+            _drop_edit_source(fname)
+            if err:
+                return json.dumps({"error": "edit failed", "detail": err})
+            b64, mime = _inline_image(raw)
+            return json.dumps({
+                "status": "ok", "seed": sd, "steps": st, "private": True,
+                "note": "The edited image has ALREADY been attached to your reply "
+                        "automatically. Do NOT output a URL, a markdown image, or "
+                        "base64 data -- just describe the result in words."}), (b64, mime)
+
         r = await c.post(f"{COMFY}/prompt", json={"prompt": wf})
         if r.status_code != 200:
+            _drop_edit_source(fname)
             return json.dumps({"error": f"ComfyUI rejected the edit: {r.text[:300]}"})
         pid = r.json()["prompt_id"]
         for _ in range(300):
@@ -515,13 +581,16 @@ async def edit_image(image_url: str, instruction: str, steps: int = 4,
                 await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
                                    prompt=f"[edit] {instruction}", subject=subject, source_file=fn,
                                    image_b64=base64.b64encode(raw).decode())
+                _drop_edit_source(fname)
                 return json.dumps({
                     "status": "ok", "url": url, "seed": sd, "steps": st,
                     "markdown": f"![{instruction[:70]}]({url})",
                     "note": "Include the markdown field verbatim to show the edited image."})
             stt = d.get("status", {})
             if stt.get("status_str") == "error":
+                _drop_edit_source(fname)
                 return json.dumps({"error": "edit failed", "detail": str(stt)[:400]})
+        _drop_edit_source(fname)
         return json.dumps({"error": "timed out"})
 
 
