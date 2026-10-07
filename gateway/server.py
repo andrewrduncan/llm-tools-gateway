@@ -22,6 +22,7 @@ from .config import (UPSTREAM, KEYS_FILE, PROGRESS, MAX_TOOL_ROUNDS as MAX_ROUND
                      MIN_TEMPERATURE as MIN_TEMP,
                      DRY_MULTIPLIER, DRY_PENALTY_LAST_N as DRY_LAST_N,
                      PRIVATE_CHAT_ID_PREFIXES, PRIVATE_MODEL_SUFFIX,
+                     PRIVATE_TWIN_MODELS,
                      PRIVATE_DISABLED_TOOLS)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -600,7 +601,8 @@ async def models(request: Request):
     if PRIVATE_MODEL_SUFFIX and isinstance(data.get("data"), list):
         twins = [{**m, "id": str(m["id"]) + PRIVATE_MODEL_SUFFIX}
                  for m in data["data"]
-                 if m.get("id") and not str(m["id"]).endswith(PRIVATE_MODEL_SUFFIX)]
+                 if m.get("id") and not str(m["id"]).endswith(PRIVATE_MODEL_SUFFIX)
+                 and (not PRIVATE_TWIN_MODELS or str(m["id"]) in PRIVATE_TWIN_MODELS)]
         data["data"] = data["data"] + twins
     return JSONResponse(data, status_code=r.status_code)
 

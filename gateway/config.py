@@ -77,6 +77,15 @@ PRIVATE_CHAT_ID_PREFIXES = tuple(p.strip() for p in os.environ.get(
     "PRIVATE_CHAT_ID_PREFIXES", "temporary:,local:").split(",") if p.strip())
 PRIVATE_MODEL_SUFFIX = os.environ.get("PRIVATE_MODEL_SUFFIX", "-private")
 
+# Which upstream models get a "-private" twin advertised in /v1/models. Empty
+# means all of them, which suits a single-model deployment. Name them explicitly
+# when only some models should be offered in private mode -- for example when
+# one model is an uncensored build kept for private use and the stock model is
+# not. A client can still request any "<model>-private" by name; this controls
+# what is advertised, not what is accepted.
+PRIVATE_TWIN_MODELS = {m.strip() for m in os.environ.get(
+    "PRIVATE_TWIN_MODELS", "").split(",") if m.strip()}
+
 # Withheld in private mode: every tool that reads or writes durable state. The
 # model is never offered them, so it cannot leak into or out of the session.
 PRIVATE_DISABLED_TOOLS = {t.strip() for t in os.environ.get(
