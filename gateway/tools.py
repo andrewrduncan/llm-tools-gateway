@@ -171,6 +171,70 @@ SUBJECT_TOOLS = {"remember", "recall", "forget", "search_documents",
 PRIVATE_AWARE_TOOLS = {"generate_image", "edit_image"}
 
 # ---------------------------------------------------------------- helpers
+def _to_websocket_output(wf: dict) -> dict:
+    """Swap a workflow's disk-writing output node for the websocket one.
+
+    SaveImage writes the PNG into ComfyUI's output directory before the gateway
+    ever sees it. Deleting it afterwards is a promise that fails on a crash, a
+    timeout, or a permissions change; SaveImageWebsocket means the bytes never
+    reach a filesystem at all. Derived from the live workflow rather than kept
+    as a second JSON file, so the two cannot drift apart.
+    """
+    out = {}
+    for nid, node in wf.items():
+        if node.get("class_type") in ("SaveImage", "SaveImageAdvanced"):
+            out[nid] = {"class_type": "SaveImageWebsocket",
+                        "inputs": {"images": node["inputs"]["images"]}}
+        else:
+            out[nid] = node
+    return out
+
+
+async def _comfy_generate_ws(wf: dict, timeout: float = 300.0):
+    """Run a workflow and collect its image over the websocket.
+
+    Returns (png_bytes, error). ComfyUI frames images exactly like previews: an
+    8-byte header (binary type, then image format) followed by the PNG.
+    """
+    import uuid as _uuid
+    import websockets
+    cid = str(_uuid.uuid4())
+    ws_url = (COMFY.replace("https://", "wss://").replace("http://", "ws://")
+              + f"/ws?clientId={cid}")
+    try:
+        async with websockets.connect(ws_url, max_size=None, open_timeout=30) as ws:
+            # Queue only AFTER the socket is open, or the early frames are lost.
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(f"{COMFY}/prompt",
+                                 json={"prompt": wf, "client_id": cid})
+                if r.status_code != 200:
+                    return None, f"ComfyUI rejected the job: {r.text[:300]}"
+                pid = r.json()["prompt_id"]
+            raw = None
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while loop.time() < deadline:
+                msg = await asyncio.wait_for(ws.recv(),
+                                             timeout=max(1.0, deadline - loop.time()))
+                if isinstance(msg, (bytes, bytearray)):
+                    if len(msg) > 8:
+                        raw = bytes(msg[8:])        # strip the 8-byte header
+                    continue
+                try:
+                    d = json.loads(msg)
+                except Exception:
+                    continue
+                if d.get("type") == "execution_error":
+                    return None, str(d.get("data"))[:300]
+                if d.get("type") == "executing":
+                    dd = d.get("data") or {}
+                    if dd.get("node") is None and dd.get("prompt_id") == pid:
+                        break                        # this prompt is finished
+            return (raw, None) if raw else (None, "no image received over websocket")
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def _inline_image(raw: bytes):
     """Re-encode for inclusion in the transcript and return (data_uri_b64, mime).
 
@@ -296,6 +360,19 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
       "9":{"class_type":"VAEDecode","inputs":{"samples":["8",0],"vae":["3",0]}},
       "10":{"class_type":"SaveImage","inputs":{"filename_prefix":"gen","images":["9",0]}},
     }
+    if private:
+        # Private turns never let the image reach a filesystem: the output node
+        # is swapped for SaveImageWebsocket and the bytes arrive over the socket.
+        raw, err = await _comfy_generate_ws(_to_websocket_output(wf))
+        if err:
+            return json.dumps({"error": "generation failed", "detail": err})
+        b64, mime = _inline_image(raw)
+        return json.dumps({
+            "status": "ok", "seed": sd, "size": f"{w}x{h}", "private": True,
+            "note": "Private turn: the image is attached to this conversation "
+                    "only. It was never written to disk and has no URL. "
+                    "Describe it; do not invent a link."}), (b64, mime)
+
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(f"{COMFY}/prompt", json={"prompt": wf})
         if r.status_code != 200:
@@ -312,23 +389,6 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
                 fn = imgs[0]["filename"]
                 raw = (await c.get(f"{COMFY}/view",
                                    params={"filename": fn, "type": "output"})).content
-                if private:
-                    # Nothing is written down: no object, no index row, no
-                    # embedding. The image is handed back inline and lives only
-                    # in the transcript. Remove the generator's own copy too --
-                    # ComfyUI writes it to disk before we ever see it.
-                    b64, mime = _inline_image(raw)
-                    if COMFY_OUTPUT_DIR:
-                        try:
-                            os.remove(os.path.join(COMFY_OUTPUT_DIR, os.path.basename(fn)))
-                        except OSError:
-                            pass
-                    return json.dumps({
-                        "status": "ok", "seed": sd, "size": f"{w}x{h}",
-                        "private": True,
-                        "note": "Private turn: the image is attached to this "
-                                "conversation only. It was not stored and has no "
-                                "URL. Describe it; do not invent a link."}), (b64, mime)
                 url = f"{COMFY_PUB}/view?filename={fn}&type=output"   # fallback
                 try:
                     # Durable object storage: a ComfyUI /view URL dies when its
