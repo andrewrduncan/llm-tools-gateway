@@ -22,8 +22,8 @@ from .config import (UPSTREAM, KEYS_FILE, PROGRESS, MAX_TOOL_ROUNDS as MAX_ROUND
                      MIN_TEMPERATURE as MIN_TEMP,
                      DRY_MULTIPLIER, DRY_PENALTY_LAST_N as DRY_LAST_N,
                      PRIVATE_CHAT_ID_PREFIXES, PRIVATE_MODEL_SUFFIX,
-                     PRIVATE_TWIN_MODELS,
-                     PRIVATE_DISABLED_TOOLS)
+                     PRIVATE_TWIN_MODELS, PRIVATE_DISABLED_TOOLS,
+                     STRIP_HISTORY_IMAGES, KEEP_RECENT_IMAGES)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -113,6 +113,33 @@ def identify(request):
         if rec:
             return rec.get("subject"), rec.get("label", "api-key")
     return None, "anonymous"
+
+
+def strip_history_images(messages, keep=1):
+    """Drop all but the newest `keep` images, leaving a placeholder for the rest.
+
+    Returns the number removed. The model still knows an image was there and
+    roughly what it was, which keeps follow-ups like "make it darker" coherent;
+    it just cannot re-examine the pixels of something it already described.
+    """
+    if not messages:
+        return 0
+    # Walk backwards so "newest" is counted from the end of the conversation.
+    seen = removed = 0
+    for m in reversed(messages):
+        parts = m.get("content")
+        if not isinstance(parts, list):
+            continue
+        for i, part in enumerate(parts):
+            if not (isinstance(part, dict) and part.get("type") == "image_url"):
+                continue
+            seen += 1
+            if seen <= keep:
+                continue
+            parts[i] = {"type": "text",
+                        "text": "[earlier image removed from history to save context]"}
+            removed += 1
+    return removed
 
 
 def is_private(body) -> bool:
@@ -267,6 +294,11 @@ def drop_anti_loop(body):
 async def chat(request: Request):
     body = await request.json()
     subject, source = identify(request)
+    if STRIP_HISTORY_IMAGES:
+        n = strip_history_images(body.get("messages"), KEEP_RECENT_IMAGES)
+        if n:
+            log.info("stripped %d image(s) from history (kept newest %d)",
+                     n, KEEP_RECENT_IMAGES)
     private = is_private(body)
     body.pop("private", None)          # our flag, not an upstream parameter
     # A "-private" model entry is how a client with no private-chat concept opts
