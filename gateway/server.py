@@ -173,6 +173,17 @@ async def call_upstream(client, body):
     return r.json()
 
 
+def log_args(args, private: bool) -> str:
+    """Tool arguments for the log -- withheld entirely on a private turn.
+
+    Container logs outlive the conversation and sit on the host in plaintext, so
+    logging a prompt defeats the point of a mode whose promise is that nothing
+    is written down. The tool name is still recorded: knowing that an image was
+    generated is operationally useful and reveals nothing about what it was.
+    """
+    return "<redacted>" if private else json.dumps(args)[:140]
+
+
 async def execute(tool_calls, subject=None, source=None, private=False):
     """Run our tools. Returns (tool_messages, images_to_inject)."""
     msgs, images = [], []
@@ -182,7 +193,7 @@ async def execute(tool_calls, subject=None, source=None, private=False):
             args = json.loads(fn.get("arguments") or "{}")
         except Exception:
             args = {}
-        log.info("tool: %s(%s) [subject=%s%s]", fn["name"], json.dumps(args)[:140],
+        log.info("tool: %s(%s) [subject=%s%s]", fn["name"], log_args(args, private),
                  subject, " PRIVATE" if private else "")
         text, img = await T.run(fn["name"], args, subject=subject, source=source,
                                 private=private)
@@ -320,7 +331,7 @@ async def chat(request: Request):
                 args = {}
             icon = ICONS.get(name, "\U0001F527")
             yield f"{icon} {name}({_brief(args)})\n"
-            log.info("tool: %s(%s) [subject=%s%s]", name, json.dumps(args)[:140],
+            log.info("tool: %s(%s) [subject=%s%s]", name, log_args(args, private),
                      subject, " PRIVATE" if private else "")
             t0 = time.time()
             # Run the tool as a task so we can emit heartbeats while it works.
