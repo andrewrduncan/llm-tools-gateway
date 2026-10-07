@@ -6,8 +6,7 @@ from . import memory as M
 from .backends import s3
 
 from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
-                     COMFY_PUBLIC_URL as COMFY_PUB,
-                     PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR, COMFY_OUTPUT_DIR,
+                     PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR,
                      WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities,
                      PRIVATE_IMAGE_FORMAT, PRIVATE_IMAGE_QUALITY,
                      COMFY_INPUT_DIR, COMFY_INPUT_TTL)
@@ -416,46 +415,29 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
                     "base64 data of any kind -- just describe the image in "
                     "words. It was never written to disk and has no URL."}), (b64, mime)
 
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(f"{COMFY}/prompt", json={"prompt": wf})
-        if r.status_code != 200:
-            return json.dumps({"error": f"ComfyUI rejected the job: {r.text[:300]}"})
-        pid = r.json()["prompt_id"]
-        for _ in range(150):                      # up to ~5 min
-            await asyncio.sleep(2)
-            h_ = (await c.get(f"{COMFY}/history/{pid}")).json()
-            if pid not in h_:
-                continue
-            d = h_[pid]
-            imgs = [i for o in d.get("outputs", {}).values() for i in o.get("images", [])]
-            if imgs:
-                fn = imgs[0]["filename"]
-                raw = (await c.get(f"{COMFY}/view",
-                                   params={"filename": fn, "type": "output"})).content
-                url = f"{COMFY_PUB}/view?filename={fn}&type=output"   # fallback
-                try:
-                    # Durable object storage: a ComfyUI /view URL dies when its
-                    # output dir is cleaned, silently breaking old chat images.
-                    key = _img_key("gen")
-                    url = await s3.put(key, raw, "image/png")
-                    await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
-                                       prompt=prompt, subject=subject, source_file=fn,
-                                       image_b64=base64.b64encode(raw).decode())
-                except Exception as e:
-                    log_err = f"{type(e).__name__}: {e}"
-                    return json.dumps({"status": "ok", "url": url, "seed": sd,
-                                       "size": f"{w}x{h}",
-                                       "markdown": f"![{prompt[:80]}]({url})",
-                                       "warning": f"stored locally only: {log_err}",
-                                       "note": "Include the markdown verbatim to show the image."})
-                return json.dumps({
-                    "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}",
-                    "markdown": f"![{prompt[:80]}]({url})",
-                    "note": "Include the markdown field verbatim in your reply to show the image."})
-            st = d.get("status", {})
-            if st.get("status_str") == "error":
-                return json.dumps({"error": "generation failed", "detail": str(st)[:300]})
-        return json.dumps({"error": "timed out after ~5 minutes"})
+    # Normal turns take the same websocket path as private ones. ComfyUI's
+    # SaveImage writes the PNG to disk AND embeds the full workflow -- prompt
+    # text included -- in a tEXt chunk, so every stored image carried a readable
+    # copy of what was asked for. SaveImageWebsocket writes nothing and attaches
+    # no metadata; the gateway holds the bytes and decides where they go.
+    raw, err = await _comfy_generate_ws(_to_websocket_output(wf))
+    if err:
+        return json.dumps({"error": "generation failed", "detail": err})
+    try:
+        key = _img_key("gen")
+        url = await s3.put(key, raw, "image/png")
+        await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
+                           prompt=prompt, subject=subject, source_file=None,
+                           image_b64=base64.b64encode(raw).decode())
+    except Exception as e:
+        # There is no on-disk copy to fall back to any more, which is the point:
+        # a failure here means the image is gone, not quietly left somewhere.
+        return json.dumps({"error": "could not store the image",
+                           "detail": f"{type(e).__name__}: {e}"})
+    return json.dumps({
+        "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}",
+        "markdown": f"![{prompt[:80]}]({url})",
+        "note": "Include the markdown field verbatim in your reply to show the image."})
 
 
 async def remember(content, shared=False, tags=None, subject=None, source=None):
@@ -576,43 +558,34 @@ async def edit_image(instruction: str, image_url: str = None, steps: int = 4,
                         "automatically. Do NOT output a URL, a markdown image, or "
                         "base64 data -- just describe the result in words."}), (b64, mime)
 
-        r = await c.post(f"{COMFY}/prompt", json={"prompt": wf})
-        if r.status_code != 200:
-            _drop_edit_source(fname)
-            return json.dumps({"error": f"ComfyUI rejected the edit: {r.text[:300]}"})
-        pid = r.json()["prompt_id"]
-        for _ in range(300):
-            await asyncio.sleep(2)
-            h_ = (await c.get(f"{COMFY}/history/{pid}")).json()
-            if pid not in h_:
-                continue
-            d = h_[pid]
-            imgs = [i for o in d.get("outputs", {}).values() for i in o.get("images", [])]
-            if imgs:
-                fn = imgs[0]["filename"]
-                raw = (await c.get(f"{COMFY}/view",
-                                   params={"filename": fn, "type": "output"})).content
-                key = _img_key("edit")
-                url = await s3.put(key, raw, "image/png")
-                await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
-                                   prompt=f"[edit] {instruction}", subject=subject, source_file=fn,
-                                   image_b64=base64.b64encode(raw).decode())
-                _drop_edit_source(fname)
-                return json.dumps({
-                    "status": "ok", "url": url, "seed": sd, "steps": st,
-                    "markdown": f"![{instruction[:70]}]({url})",
-                    "note": "Include the markdown field verbatim to show the edited image."})
-            stt = d.get("status", {})
-            if stt.get("status_str") == "error":
-                _drop_edit_source(fname)
-                return json.dumps({"error": "edit failed", "detail": str(stt)[:400]})
+        # Websocket for both flows -- see generate_image. No output file, and no
+        # workflow metadata baked into the bytes we are about to store.
+        raw, err = await _comfy_generate_ws(_to_websocket_output(wf))
         _drop_edit_source(fname)
-        return json.dumps({"error": "timed out"})
+        if err:
+            return json.dumps({"error": "edit failed", "detail": err})
+        try:
+            key = _img_key("edit")
+            url = await s3.put(key, raw, "image/png")
+            await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
+                               prompt=f"[edit] {instruction}", subject=subject,
+                               source_file=None,
+                               image_b64=base64.b64encode(raw).decode())
+        except Exception as e:
+            return json.dumps({"error": "could not store the edited image",
+                               "detail": f"{type(e).__name__}: {e}"})
+        return json.dumps({
+            "status": "ok", "url": url, "seed": sd, "steps": st,
+            "markdown": f"![{instruction[:70]}]({url})",
+            "note": "Include the markdown field verbatim to show the edited image."})
 
 
 
 async def delete_image(image: str, subject=None):
     """Delete an image everywhere it exists.
+
+    Two places since generation moved to the websocket: the object and the index
+    row. There is no generator-side copy any more -- ComfyUI never writes one.
 
     Partial failures are reported rather than swallowed: an object that is gone
     but still indexed leaves a dangling search result pointing at a dead URL.
@@ -631,13 +604,6 @@ async def delete_image(image: str, subject=None):
         await M.forget_file(row["id"]); removed.append("search index")
     except Exception as e:
         failed.append(f"search index: {type(e).__name__}: {e}")
-    if COMFY_OUTPUT_DIR and row["source_file"]:
-        p = os.path.join(COMFY_OUTPUT_DIR, os.path.basename(row["source_file"]))
-        try:
-            if os.path.exists(p):
-                os.remove(p); removed.append("generator output")
-        except Exception as e:
-            failed.append(f"generator output: {type(e).__name__}: {e}")
     return json.dumps({"status": "ok" if not failed else "partial",
                        "deleted_from": removed, "errors": failed,
                        "prompt": row["prompt"],
