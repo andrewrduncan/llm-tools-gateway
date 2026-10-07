@@ -133,6 +133,24 @@ def is_private(body) -> bool:
     return False
 
 
+# A model cannot reproduce a 200 KB data URI. Asked to display a private image
+# it reconstructs the JPEG header from memory, emits the standard quantisation
+# table, then degenerates into a repeating loop -- minutes of streaming garbage.
+# So the gateway attaches the image itself and strips anything URI-shaped the
+# model produced on its own, which is junk by definition.
+_MODEL_DATA_URI = re.compile(
+    r"!?\[[^\]]*\]\(\s*data:image/[^)]*\)"
+    r"|data:image/[a-zA-Z]+;base64,[A-Za-z0-9+/=\s]{80,}")
+
+
+def attach_inline(text, uris):
+    """Strip any model-invented data URI, then attach the real images."""
+    text = _MODEL_DATA_URI.sub("", text or "").rstrip()
+    for u in uris:
+        text += f"\n\n![generated image]({u})"
+    return text
+
+
 def image_label(tool_name: str) -> str:
     return ("Screenshot from browse_page:" if tool_name == "browse_page"
             else f"Image produced by {tool_name}:")
@@ -360,8 +378,12 @@ async def chat(request: Request):
             if img:
                 images.append(as_image(img, name))
         inject_images(messages, images)
+        if private:
+            inline_images.extend(f"data:{m};base64,{b}" for (l, b, m) in images
+                                 if l.startswith("Image produced by"))
 
-    turn_images = []   # image URLs produced this turn, for repair_image_urls
+    turn_images = []     # image URLs produced this turn, for repair_image_urls
+    inline_images = []   # private images the gateway attaches itself
 
     async def apply(msg, tcs):
         """Append the assistant turn, run the tools, inject any screenshots."""
@@ -382,6 +404,9 @@ async def chat(request: Request):
                     pass
         messages.extend(tool_msgs)
         inject_images(messages, images)
+        if private:
+            inline_images.extend(f"data:{m};base64,{b}" for (l, b, m) in images
+                                 if l.startswith("Image produced by"))
 
     # ---------------------------------------------------------- non-streaming
     if not stream:
@@ -392,17 +417,22 @@ async def chat(request: Request):
                 msg = data["choices"][0]["message"]
                 tcs = msg.get("tool_calls") or []
                 if not mine_only(tcs):
-                    if turn_images and not tcs:
+                    if not tcs:
                         m0 = data["choices"][0]["message"]
-                        m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
+                        if turn_images:
+                            m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
+                        if inline_images:
+                            m0["content"] = attach_inline(m0.get("content"), inline_images)
                     return JSONResponse(data)
                 await apply(msg, tcs)
             body["messages"] = messages
             body["tool_choice"] = "none"
             data = await call_upstream(client, body)
+            m0 = data["choices"][0]["message"]
             if turn_images:
-                m0 = data["choices"][0]["message"]
                 m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
+            if inline_images:
+                m0["content"] = attach_inline(m0.get("content"), inline_images)
             return JSONResponse(data)
 
     # ---------------------------------------------------------- streaming
@@ -473,10 +503,12 @@ async def chat(request: Request):
                         if ch.get("finish_reason"):
                             finish = ch["finish_reason"]
                 tcs = [acc_tcs[k] for k in sorted(acc_tcs)]
-                if not tcs and buf:
+                if not tcs and (buf or inline_images):
                     whole = "".join(buf)
                     if turn_images:
                         whole = repair_image_urls(whole, turn_images)
+                    if inline_images:
+                        whole = attach_inline(whole, inline_images)
                     yield sse(chunk(cid, model, {"content": whole}))
                 if not tcs:
                     yield sse(chunk(cid, model, {}, finish=finish))
