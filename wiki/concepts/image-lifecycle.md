@@ -2,15 +2,16 @@
 title: Image lifecycle and the three copies
 type: concept
 tags: [images, storage, deletion, privacy]
-updated: 2026-08-31
+updated: 2026-10-07
 sources: [gateway/tools.py, gateway/memory.py, gateway/backends/s3.py, schema.sql]
-verified_at: 2026-08-31
+verified_at: 2026-10-07
 ---
 
 # Image lifecycle and the three copies
 
 One generated image exists in **three independent places**, written by
-`generate_image` / `edit_image` (`gateway/tools.py`):
+`generate_image` / `edit_image` (`gateway/tools.py`). This describes a *normal*
+turn; a private turn writes **none of them** — see [[private-mode]].
 
 | Copy | Written by | Removing it stops |
 |---|---|---|

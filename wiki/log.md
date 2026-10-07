@@ -1,3 +1,9 @@
+---
+title: Log
+type: index
+updated: 2026-10-07
+---
+
 # Log
 
 Append-only. Newest last.
@@ -32,3 +38,41 @@ silently. Now sends both spellings plus DRY. New page:
 Also: `server.py` was re-reading six env vars that `config.py` already defined, so the
 two could drift; it now imports config, as the module docstring always claimed.
 
+## [2026-10-07] change | private mode, quoting vs anti-loop, image context cost, CI
+
+Added **private mode**: a turn that writes nothing. Persistence tools are withheld
+from the tool list rather than discouraged, generated images arrive over the
+websocket instead of being written and deleted, the gateway attaches them rather
+than asking the model to emit base64, and tool arguments are redacted from logs.
+New pages: [private-mode](concepts/private-mode.md),
+[private-mode-leak-audit](analyses/private-mode-leak-audit.md).
+
+Found the anti-repetition guard **corrupts quoted tool output**. DRY cannot tell
+faithful quotation from a degenerate loop, so a date supplied by
+`get_current_datetime` came back as October 06 **2178**. 0/4 correct with DRY at
+any look-back, 3/3 without. This partly supersedes
+[engine-parameter-dialects](concepts/engine-parameter-dialects.md), which
+recorded adding DRY as a fix. New page:
+[verbatim-vs-anti-loop](concepts/verbatim-vs-anti-loop.md).
+
+A second image turn needed ~13 minutes of prefill: a 105k-token prompt, because
+llama.cpp disables prefix caching for multimodal and re-encodes every historical
+image every request. History images are now stripped to a text placeholder. New
+page: [context-cost-of-images](concepts/context-cost-of-images.md).
+
+`edit_image` required an `image_url` that private mode had made impossible to
+obtain; the model invented imgur links to fill the slot. The gateway now resolves
+the newest image in the conversation and injects it, as it already did for
+`subject`.
+
+Fixed `COMFY_PUB` (referenced, never defined — would have thrown on every
+generation) and a function-local `import base64` shadowing the module-level one,
+which broke every edit with `UnboundLocalError`. Both are the same class of bug
+and are now covered by an undefined-name scan.
+
+CI publishes the image to ghcr.io; deployments pull a tag instead of building
+locally. New page: [ci-pipeline](entities/ci-pipeline.md). Added a root
+`CLAUDE.md` covering invariants, workflow and known traps.
+
+**Still open:** `workflow.load()` is never called, so the mounted workflow JSON
+files are decorative and the README's "export your own and drop it in" is untrue.
