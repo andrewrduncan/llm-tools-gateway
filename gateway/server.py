@@ -526,6 +526,36 @@ async def admin_index(request: Request):
                                   subject=b.get("subject"))
 
 
+@app.get("/v1/models")
+async def models(request: Request):
+    """Advertise a "-private" twin of every upstream model.
+
+    Private mode needs to be selectable from clients that cannot pass a flag of
+    their own. Open WebUI is the case in point: it filters its model list down
+    to what the backend actually advertises, so an entry that is not listed here
+    never appears in the picker no matter what is configured locally. Listing
+    the twin here makes private mode available everywhere at once -- the picker,
+    opencode, a curl one-liner -- with no per-client setup.
+
+    The suffix is stripped again before the request reaches the model server.
+    """
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as c:
+        r = await c.get(f"{UPSTREAM}/v1/models",
+                        headers={k: v for k, v in request.headers.items()
+                                 if k.lower() == "authorization"})
+    try:
+        data = r.json()
+    except Exception:
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type=r.headers.get("content-type"))
+    if PRIVATE_MODEL_SUFFIX and isinstance(data.get("data"), list):
+        twins = [{**m, "id": str(m["id"]) + PRIVATE_MODEL_SUFFIX}
+                 for m in data["data"]
+                 if m.get("id") and not str(m["id"]).endswith(PRIVATE_MODEL_SUFFIX)]
+        data["data"] = data["data"] + twins
+    return JSONResponse(data, status_code=r.status_code)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def passthrough(path: str, request: Request):
     """Everything else (/v1/models, /metrics, ...) goes straight to vLLM."""
