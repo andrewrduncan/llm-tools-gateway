@@ -45,3 +45,10 @@ correct afterwards; nothing surfaces the difference.
 **Match the penalty to the failure.** `repeat_penalty` discourages repeated *tokens*;
 real loops repeat multi-token *sequences* (a line or block cycling). DRY targets
 sequences, and llama.cpp's 64-token look-back is too narrow to see a repeating block.
+
+---
+
+> **Partly superseded (2026-10-07).** Adding DRY here fixed repetition in plain
+> generation and **broke verbatim quotation of tool results** — 0/4 correct when
+> restating a date the tool had just supplied. Anti-loop sampling is now dropped
+> for any turn carrying tool output. See [[verbatim-vs-anti-loop]].
