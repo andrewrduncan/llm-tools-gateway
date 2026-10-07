@@ -64,6 +64,18 @@ S3_KEY_ID = os.environ.get("S3_KEY_ID", "")
 S3_SECRET = os.environ.get("S3_SECRET", "")
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 
+# ---- history images -------------------------------------------------------
+# Vision models turn one screenshot into tens of thousands of tokens, and the
+# whole conversation is re-sent every turn. llama.cpp also disables prefix
+# caching entirely for multimodal models, so every historical image is
+# re-encoded from scratch on every request: a second image-editing turn was
+# measured at a 105k-token prompt needing ~13 minutes of prefill.
+#
+# Keeping only the newest images and leaving a text placeholder for the rest
+# preserves the thread of the conversation at ~15 tokens instead of ~15,000.
+STRIP_HISTORY_IMAGES = _b("STRIP_HISTORY_IMAGES", "1")
+KEEP_RECENT_IMAGES = int(os.environ.get("KEEP_RECENT_IMAGES", "1"))
+
 # ---- private / ephemeral mode ---------------------------------------------
 # Nothing generated in a private turn is written down: no object storage, no
 # index row, no embedding, no memory. The image comes back inline in the
