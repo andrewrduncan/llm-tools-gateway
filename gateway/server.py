@@ -239,6 +239,14 @@ async def chat(request: Request):
     subject, source = identify(request)
     private = is_private(body)
     body.pop("private", None)          # our flag, not an upstream parameter
+    # A "-private" model entry is how a client with no private-chat concept opts
+    # in -- Open WebUI among them: it filters the request through a parameter
+    # allowlist that has no chat_id, and pops metadata entirely, so its own
+    # Temporary Chat toggle cannot reach a backend. The suffix is ours, not the
+    # upstream's, so strip it before forwarding or the model server 404s.
+    if (private and PRIVATE_MODEL_SUFFIX
+            and str(body.get("model") or "").endswith(PRIVATE_MODEL_SUFFIX)):
+        body["model"] = body["model"][:-len(PRIVATE_MODEL_SUFFIX)]
     if private:
         log.info("PRIVATE turn [subject=%s chat_id=%s] -- no storage, no memory tools",
                  subject, body.get("chat_id")
