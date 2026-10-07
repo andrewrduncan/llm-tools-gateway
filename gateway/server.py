@@ -115,6 +115,28 @@ def identify(request):
     return None, "anonymous"
 
 
+def newest_conversation_image(messages):
+    """The most recent image in the conversation, as a data URI or URL.
+
+    A model cannot cite an image it was shown: an upload arrives as a 150 KB
+    data URI it cannot copy into an argument, and a privately generated image
+    has no URL at all by design. Asked to edit "this image" it therefore
+    invents a plausible-looking address -- an imgur link, observed in practice.
+    Resolving the reference here is the same move as injecting `subject`: the
+    gateway supplies what only it can know.
+    """
+    for m in reversed(messages or []):
+        parts = m.get("content")
+        if not isinstance(parts, list):
+            continue
+        for part in reversed(parts):
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url")
+                if url:
+                    return url
+    return None
+
+
 def strip_history_images(messages, keep=1):
     """Drop all but the newest `keep` images, leaving a placeholder for the rest.
 
@@ -230,7 +252,8 @@ def log_args(args, private: bool) -> str:
     return "<redacted>" if private else json.dumps(args)[:140]
 
 
-async def execute(tool_calls, subject=None, source=None, private=False):
+async def execute(tool_calls, subject=None, source=None, private=False,
+                  conversation_image=None):
     """Run our tools. Returns (tool_messages, images_to_inject)."""
     msgs, images = [], []
     for tc in tool_calls:
@@ -242,7 +265,7 @@ async def execute(tool_calls, subject=None, source=None, private=False):
         log.info("tool: %s(%s) [subject=%s%s]", fn["name"], log_args(args, private),
                  subject, " PRIVATE" if private else "")
         text, img = await T.run(fn["name"], args, subject=subject, source=source,
-                                private=private)
+                                private=private, conversation_image=conversation_image)
         msgs.append({"role": "tool", "tool_call_id": tc["id"],
                      "name": fn["name"], "content": text})
         if img:
@@ -299,6 +322,7 @@ async def chat(request: Request):
         if n:
             log.info("stripped %d image(s) from history (kept newest %d)",
                      n, KEEP_RECENT_IMAGES)
+    conversation_image = newest_conversation_image(body.get("messages"))
     private = is_private(body)
     body.pop("private", None)          # our flag, not an upstream parameter
     # A "-private" model entry is how a client with no private-chat concept opts
@@ -389,7 +413,8 @@ async def chat(request: Request):
             # generate_image takes ~50s; without this the client goes silent and
             # the user cannot tell "working" from "hung".
             task = asyncio.create_task(T.run(name, args, subject=subject,
-                                             source=source, private=private))
+                                             source=source, private=private,
+                                             conversation_image=conversation_image))
             while True:
                 done, _ = await asyncio.wait({task}, timeout=10)
                 if done:
@@ -426,7 +451,8 @@ async def chat(request: Request):
         # so the anti-loop penalties have to come off (see _ANTI_LOOP_KEYS).
         drop_anti_loop(body)
         tool_msgs, images = await execute(tcs, subject=subject, source=source,
-                                          private=private)
+                                          private=private,
+                                          conversation_image=conversation_image)
         for tm in tool_msgs:
             if tm.get("name") in ("generate_image", "edit_image"):
                 try:

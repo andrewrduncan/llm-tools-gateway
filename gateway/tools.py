@@ -148,18 +148,22 @@ DEFS = [
         "name": "edit_image",
         "description": "Edit an EXISTING image using a natural-language instruction "
                        "(change colours, replace objects, alter style/lighting, remove or "
-                       "add things, change backgrounds). Requires an image URL - use "
-                       "search_images first if the user refers to an earlier image. "
+                       "add things, change backgrounds). If the user means an image "
+                       "already in this conversation - one they attached, or one you "
+                       "just generated - OMIT image_url entirely and it is resolved "
+                       "automatically. NEVER invent a URL. "
                        "For creating a brand new image from nothing, use generate_image. "
                        "Takes about a minute. Include the returned markdown verbatim.",
         "parameters": {"type": "object", "properties": {
             "image_url":   {"type": "string",
-                            "description": "URL of the image to edit (e.g. from search_images)."},
+                            "description": "Optional. Only for an image NOT in this "
+                                           "conversation. Omit it to edit the image "
+                                           "already here."},
             "instruction": {"type": "string",
                             "description": "What to change, e.g. 'make the sail blue and add seagulls'."},
             "steps":       {"type": "integer", "description": "Default 4 (Lightning)."},
             "seed":        {"type": "integer"}},
-            "required": ["image_url", "instruction"]}}},
+            "required": ["instruction"]}}},
 ]
 NAMES = {d["function"]["name"] for d in DEFS}
 
@@ -496,8 +500,9 @@ async def _comfy_upload(client, raw: bytes, name: str) -> str:
     return f"{ref} [temp]" if (j.get("type") or "temp") == "temp" else ref
 
 
-async def edit_image(image_url: str, instruction: str, steps: int = 4,
-                     seed: int = None, subject=None, private: bool = False) -> str:
+async def edit_image(instruction: str, image_url: str = None, steps: int = 4,
+                     seed: int = None, subject=None, private: bool = False,
+                     conversation_image: str = None) -> str:
     """Mirrors ComfyUI's official image_qwen_image_edit_2509 template. Every node
     here matters -- an earlier hand-rolled version omitted ModelSamplingAuraFlow
     and CFGNorm and produced a faithful COPY of the input with the instruction
@@ -505,12 +510,25 @@ async def edit_image(image_url: str, instruction: str, steps: int = 4,
     sd = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big")
     st = max(2, min(int(steps or 4), 20))
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        # Prefer the conversation's own image. A model asked to edit "this"
+        # has no way to know its address, so a URL it supplies is invented
+        # unless it is one the gateway handed it earlier.
+        ref = image_url
+        if conversation_image and not (image_url or "").startswith((PUBLIC_URL, "data:")):
+            ref = conversation_image
+        if not ref:
+            return json.dumps({"error": "no image to edit",
+                               "note": "Attach an image, or generate one first."})
         try:
-            src = (await c.get(image_url)).content
+            if ref.startswith("data:"):
+                src = base64.b64decode(ref.split(",", 1)[1])
+            else:
+                src = (await c.get(ref)).content
             if len(src) < 500:
                 return json.dumps({"error": f"source image invalid ({len(src)} bytes)"})
         except Exception as e:
-            return json.dumps({"error": f"could not fetch image_url: {type(e).__name__}: {e}"})
+            return json.dumps({"error": f"could not read the source image: "
+                                        f"{type(e).__name__}: {e}"})
         _sweep_edit_sources()      # clear anything a previous crash orphaned
         fname = await _comfy_upload(c, src, f"edit-src-{sd}.png")
 
@@ -638,9 +656,16 @@ DISPATCH = {"get_current_datetime": get_current_datetime, "web_search": web_sear
 # image generation legitimately takes ~40s+; the default 90s cap is too tight
 TIMEOUTS = {"generate_image": 330, "edit_image": 700}
 
-async def run(name: str, args: dict, subject=None, source=None, private=False):
+async def run(name: str, args: dict, subject=None, source=None, private=False,
+              conversation_image=None):
     """Execute a server tool. Returns (text, optional_image_b64)."""
     fn = DISPATCH[name]
+    if name == "edit_image":
+        # SECURITY/CORRECTNESS: like subject, this comes from the request. The
+        # model cannot know the address of an image it was merely shown, so any
+        # URL it supplies for one is a guess; the conversation's own image wins.
+        args.pop("conversation_image", None)
+        args["conversation_image"] = conversation_image
     if name in PRIVATE_AWARE_TOOLS:
         # SECURITY: like subject, this comes from the request, never the model.
         args.pop("private", None)
