@@ -369,9 +369,10 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
         b64, mime = _inline_image(raw)
         return json.dumps({
             "status": "ok", "seed": sd, "size": f"{w}x{h}", "private": True,
-            "note": "Private turn: the image is attached to this conversation "
-                    "only. It was never written to disk and has no URL. "
-                    "Describe it; do not invent a link."}), (b64, mime)
+            "note": "The image has ALREADY been attached to your reply "
+                    "automatically. Do NOT output a URL, a markdown image, or "
+                    "base64 data of any kind -- just describe the image in "
+                    "words. It was never written to disk and has no URL."}), (b64, mime)
 
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(f"{COMFY}/prompt", json={"prompt": wf})
