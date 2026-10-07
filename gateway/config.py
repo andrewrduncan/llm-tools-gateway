@@ -48,14 +48,15 @@ SEARXNG_URL = os.environ.get("SEARXNG_URL", "").rstrip("/")
 PG_DSN = os.environ.get("PG_DSN", "")
 EMBED_URL = os.environ.get("EMBED_URL", "").rstrip("/")
 COMFY_URL = os.environ.get("COMFY_URL", "").rstrip("/")
-# URL the CLIENT's browser uses to reach ComfyUI. Only used as a fallback when
-# object storage is not configured -- a compose service name like
-# http://comfyui:8188 is unreachable from a browser, so set this to a LAN or
-# public address if you rely on the fallback.
+# Unused since image output moved to the websocket. It existed only for a
+# fallback URL pointing at ComfyUI's /view endpoint, and there is no longer an
+# output file for that endpoint to serve.
 COMFY_PUBLIC_URL = os.environ.get("COMFY_PUBLIC_URL", COMFY_URL).rstrip("/")
 
-# Optional: bind-mount ComfyUI's output dir here and delete_image can remove the
-# generator's own copy too. Unset simply means that third copy is left alone.
+# Unused since image output moved to the websocket: ComfyUI no longer writes an
+# output file for the gateway to clean up. Kept so an existing deployment that
+# sets it does not break, and because a future non-websocket output node would
+# need it again.
 COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "")
 
 # Bind-mount ComfyUI's INPUT dir here so an edit can remove its own source image.
