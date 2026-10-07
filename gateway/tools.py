@@ -438,7 +438,6 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024,
                     # output dir is cleaned, silently breaking old chat images.
                     key = _img_key("gen")
                     url = await s3.put(key, raw, "image/png")
-                    import base64
                     await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
                                        prompt=prompt, subject=subject, source_file=fn,
                                        image_b64=base64.b64encode(raw).decode())
@@ -593,7 +592,6 @@ async def edit_image(instruction: str, image_url: str = None, steps: int = 4,
                 fn = imgs[0]["filename"]
                 raw = (await c.get(f"{COMFY}/view",
                                    params={"filename": fn, "type": "output"})).content
-                import base64
                 key = _img_key("edit")
                 url = await s3.put(key, raw, "image/png")
                 await M.index_file(s3.BUCKET, key, url, "image/png", len(raw),
