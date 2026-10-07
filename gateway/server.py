@@ -479,8 +479,12 @@ async def chat(request: Request):
                             elif buf is not None:
                                 buf.append(d["content"])
                                 buf_len += len(d["content"])
-                                # hold everything if an image URL may need repairing
-                                if buf_len >= FLUSH_AT and not turn_images:
+                                # Hold everything if the text still needs
+                                # rewriting at the end: an image URL to repair,
+                                # or a private turn where a model-invented data
+                                # URI has to be stripped and the real image
+                                # attached. Flushing early forfeits both.
+                                if buf_len >= FLUSH_AT and not turn_images and not private:
                                     for piece in buf:
                                         yield sse(chunk(cid, model, {"content": piece}))
                                     buf = None
@@ -504,7 +508,9 @@ async def chat(request: Request):
                             finish = ch["finish_reason"]
                 tcs = [acc_tcs[k] for k in sorted(acc_tcs)]
                 if not tcs and (buf or inline_images):
-                    whole = "".join(buf)
+                    # buf is None once it has already been flushed to the client;
+                    # there is then nothing left to rewrite, only an image to add.
+                    whole = "".join(buf) if buf else ""
                     if turn_images:
                         whole = repair_image_urls(whole, turn_images)
                     if inline_images:
