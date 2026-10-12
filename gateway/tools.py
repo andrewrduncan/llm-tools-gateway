@@ -12,7 +12,7 @@ from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
                      COMFY_INPUT_DIR, COMFY_INPUT_TTL,
                      VIDEO_ENABLED, VIDEO_UNET, VIDEO_CLIP, VIDEO_VAE,
                      VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT, VIDEO_FPS,
-                     VIDEO_MAX_SECONDS, VIDEO_STEPS, VIDEO_CFG, VIDEO_SHIFT,
+                     VIDEO_MAX_SECONDS, VIDEO_DEFAULT_SECONDS, VIDEO_STEPS, VIDEO_CFG, VIDEO_SHIFT,
                      VIDEO_NEGATIVE, VIDEO_TIMEOUT, PRIVATE_VIDEO_TTL)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
 # compose service name, or images render as broken links.
@@ -173,17 +173,19 @@ if capabilities()["video"]:
     DEFS.append(
         {"type": "function", "function": {
             "name": "generate_video",
-            "description": "Generate a SHORT video clip (max ~5 seconds) from a text "
+            "description": f"Generate a SHORT video clip (max {int(VIDEO_MAX_SECONDS)} seconds) from a text "
                            "description, optionally animating an existing image. Use when "
                            "the user asks for a video, clip, animation, or asks to make a "
                            "picture move. To animate an image already in this conversation "
                            "- one they attached or you just generated - OMIT image_url and "
                            "it is resolved automatically. NEVER invent a URL. "
-                           "This is SLOW (several minutes) and briefly evicts the chat "
-                           "model from memory, so do not call it speculatively - only when "
-                           "a video was actually asked for. It cannot produce clips longer "
-                           "than about 5 seconds; if more is wanted, say so rather than "
-                           "calling this repeatedly. Include the returned markdown verbatim.",
+                           f"This is SLOW - roughly 25 seconds of compute per second of "
+                           f"video - and it locks the GPU for the whole render, so image "
+                           f"generation and chat both stall behind it. Do NOT call it "
+                           f"speculatively; only when a video was actually asked for. It "
+                           f"cannot produce clips longer than {int(VIDEO_MAX_SECONDS)} seconds; if more is "
+                           f"wanted, say so rather than calling this repeatedly. "
+                           f"Include the returned markdown verbatim.",
             "parameters": {"type": "object", "properties": {
                 "prompt":    {"type": "string",
                               "description": "What happens in the clip. Describe MOTION, not "
@@ -194,9 +196,12 @@ if capabilities()["video"]:
                                              "conversation. Omit it to animate the image "
                                              "already here."},
                 "seconds":   {"type": "number",
-                              "description": "Clip length, 1-5. Default 5."},
-                "width":     {"type": "integer", "description": "Default 1280 (720p). Multiple of 32."},
-                "height":    {"type": "integer", "description": "Default 704. Multiple of 32."},
+                              "description": f"Clip length in seconds, 1-{int(VIDEO_MAX_SECONDS)}. "
+                                             f"Default {int(VIDEO_DEFAULT_SECONDS)}. Shorter is much faster."},
+                "width":     {"type": "integer",
+                              "description": f"Default {VIDEO_MAX_WIDTH}. Multiple of 32. Larger is not allowed."},
+                "height":    {"type": "integer",
+                              "description": f"Default {VIDEO_MAX_HEIGHT}. Multiple of 32. Larger is not allowed."},
                 "seed":      {"type": "integer", "description": "Optional, for reproducibility."}},
                 "required": ["prompt"]}}})
 
@@ -692,8 +697,7 @@ def _video_frames(seconds: float) -> int:
     steps, so a length that is not 4n+1 silently loses the remainder.
     """
     n = int(round(float(seconds) * VIDEO_FPS))
-    n = max(1, (n - 1) // 4) * 4 + 1
-    return n
+    return max(1, int(round((n - 1) / 4))) * 4 + 1
 
 
 async def _comfy_run_video(wf: dict, timeout: float):
@@ -791,7 +795,7 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
     """
     w = max(256, min(int(width or VIDEO_MAX_WIDTH), VIDEO_MAX_WIDTH)) // 32 * 32
     h = max(256, min(int(height or VIDEO_MAX_HEIGHT), VIDEO_MAX_HEIGHT)) // 32 * 32
-    secs = max(1.0, min(float(seconds or VIDEO_MAX_SECONDS), VIDEO_MAX_SECONDS))
+    secs = max(1.0, min(float(seconds or VIDEO_DEFAULT_SECONDS), VIDEO_MAX_SECONDS))
     frames = _video_frames(secs)
     sd = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big")
 

@@ -77,16 +77,39 @@ VIDEO_ENABLED = _b("VIDEO_ENABLED", "0")
 VIDEO_UNET = os.environ.get("VIDEO_UNET", "wan2.2_ti2v_5B_fp16.safetensors")
 VIDEO_CLIP = os.environ.get("VIDEO_CLIP", "umt5_xxl_fp8_e4m3fn_scaled.safetensors")
 VIDEO_VAE = os.environ.get("VIDEO_VAE", "wan2.2_vae.safetensors")
-# 1280x704 @ 24fps for 121 frames is what TI2V-5B was trained on. Going wider
-# is not just slower, it is out of distribution: motion drifts and the clip
-# stops being coherent. 704 is the cap, not a default to raise.
-VIDEO_MAX_WIDTH = int(os.environ.get("VIDEO_MAX_WIDTH", "1280"))
-VIDEO_MAX_HEIGHT = int(os.environ.get("VIDEO_MAX_HEIGHT", "704"))
+# MEASURED on gfx1151, wall clock, including the ~20-90s model load that every
+# job pays because ComfyUI runs with --cache-none:
+#   640x352  2s   8 steps ->  0m48   (24s per second of video)
+#   640x352 10s   8 steps ->  5m21   (32s per second -- scaling is superlinear)
+#   832x480  2s  20 steps ->  2m39
+#   832x480  3s  20 steps ->  5m18
+#   1280x704 2s  20 steps ->  >7m   (killed; did not finish a TWO second clip)
+#   1280x704 5s  20 steps ->  >13m  (killed, unfinished)
+# Cost scales with pixels x frames x steps, and throughput FALLS as the clip
+# grows (attention is superlinear), so the three multiply worse than linearly.
+#
+# Defaults are 360p/8 steps, which is the 0m48 row above -- roughly 24s of
+# compute per second of video. The other rows are what 480p and 720p cost.
+#
+# The caps are 360p rather than the model's native 720p for one reason
+# that is not about patience: a queued job cannot be cancelled. ComfyUI only
+# checks for an interrupt between sampler steps, so a long job is uninterruptible
+# in practice, and the only way out is restarting the container -- which has
+# already taken the LLM's Vulkan context down with it once. A 4-minute worst
+# case is recoverable. A 16-minute one holds the whole box hostage.
+#
+# 720p is NOT viable at 20 steps -- it could not finish a 2s clip in 7 minutes,
+# so the model's own native 1280x704 is out of reach on this hardware by the
+# step count alone. Raise these only once the WAN Lightning LoRAs are in: 4
+# steps instead of 20 is a 5x cut and is what would make 720p reachable.
+VIDEO_MAX_WIDTH = int(os.environ.get("VIDEO_MAX_WIDTH", "640"))
+VIDEO_MAX_HEIGHT = int(os.environ.get("VIDEO_MAX_HEIGHT", "352"))
 VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "24"))
-# 5s is the model's native length (121 frames). Longer must be produced by
-# chaining clips, which this tool does not do.
-VIDEO_MAX_SECONDS = float(os.environ.get("VIDEO_MAX_SECONDS", "5"))
-VIDEO_STEPS = int(os.environ.get("VIDEO_STEPS", "20"))
+VIDEO_MAX_SECONDS = float(os.environ.get("VIDEO_MAX_SECONDS", "10"))
+# Default shorter than the cap. Defaulting to the maximum would make every
+# unqualified "make me a video" the slowest possible job.
+VIDEO_DEFAULT_SECONDS = float(os.environ.get("VIDEO_DEFAULT_SECONDS", "5"))
+VIDEO_STEPS = int(os.environ.get("VIDEO_STEPS", "8"))
 VIDEO_CFG = float(os.environ.get("VIDEO_CFG", "5.0"))
 VIDEO_SHIFT = float(os.environ.get("VIDEO_SHIFT", "8.0"))
 VIDEO_NEGATIVE = os.environ.get(
@@ -94,7 +117,7 @@ VIDEO_NEGATIVE = os.environ.get(
     "blurry, low quality, distorted, watermark, text, static, still image")
 # Generous: a native-length clip is minutes of GPU time, and the model load is
 # paid on every job because ComfyUI runs with --cache-none.
-VIDEO_TIMEOUT = int(os.environ.get("VIDEO_TIMEOUT", "1800"))
+VIDEO_TIMEOUT = int(os.environ.get("VIDEO_TIMEOUT", "600"))
 # Private video cannot be inlined the way a private image is -- base64 of an
 # MP4 would be megabytes of context on every subsequent turn. It is held in
 # gateway memory and served once from a URL that expires.
