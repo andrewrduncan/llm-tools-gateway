@@ -615,6 +615,24 @@ async def serve_image(key: str):
                     headers={"Cache-Control": "public, max-age=31536000"})
 
 
+@app.get("/tmpvid/{token}")
+async def serve_private_video(token: str):
+    """Serve a private video from memory. Never touched a disk, expires on TTL.
+
+    A private IMAGE is inlined into the transcript; a video cannot be, because
+    base64 of an MP4 is megabytes and an inlined attachment is re-sent on every
+    later turn. So it gets a URL instead -- one that resolves only from this
+    process's memory and only until it expires.
+    """
+    got = T.private_video_get(token.rsplit(".", 1)[0])
+    if not got:
+        return Response(content="expired", status_code=404)
+    data, ctype = got
+    return Response(content=data, media_type=ctype,
+                    headers={"Cache-Control": "no-store",
+                             "Content-Length": str(len(data))})
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "tools": sorted(T.NAMES), "upstream": UPSTREAM,
