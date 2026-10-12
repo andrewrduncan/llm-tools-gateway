@@ -67,6 +67,39 @@ COMFY_INPUT_DIR = os.environ.get("COMFY_INPUT_DIR", "")
 # Safety net for sources orphaned by a crash between upload and cleanup.
 COMFY_INPUT_TTL = int(os.environ.get("COMFY_INPUT_TTL", "900"))
 
+# ---- Video generation (WAN 2.2 TI2V-5B) -----------------------------------
+# Off unless a deployment opts in. Unlike the image tools, this one cannot be
+# gated by a file the gateway can see: the weights live in ComfyUI's models
+# directory, which the gateway does not mount. An explicit flag is the honest
+# gate -- a tool that is advertised but whose weights are absent fails at call
+# time, which is exactly what "tools degrade, never break" forbids.
+VIDEO_ENABLED = _b("VIDEO_ENABLED", "0")
+VIDEO_UNET = os.environ.get("VIDEO_UNET", "wan2.2_ti2v_5B_fp16.safetensors")
+VIDEO_CLIP = os.environ.get("VIDEO_CLIP", "umt5_xxl_fp8_e4m3fn_scaled.safetensors")
+VIDEO_VAE = os.environ.get("VIDEO_VAE", "wan2.2_vae.safetensors")
+# 1280x704 @ 24fps for 121 frames is what TI2V-5B was trained on. Going wider
+# is not just slower, it is out of distribution: motion drifts and the clip
+# stops being coherent. 704 is the cap, not a default to raise.
+VIDEO_MAX_WIDTH = int(os.environ.get("VIDEO_MAX_WIDTH", "1280"))
+VIDEO_MAX_HEIGHT = int(os.environ.get("VIDEO_MAX_HEIGHT", "704"))
+VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "24"))
+# 5s is the model's native length (121 frames). Longer must be produced by
+# chaining clips, which this tool does not do.
+VIDEO_MAX_SECONDS = float(os.environ.get("VIDEO_MAX_SECONDS", "5"))
+VIDEO_STEPS = int(os.environ.get("VIDEO_STEPS", "20"))
+VIDEO_CFG = float(os.environ.get("VIDEO_CFG", "5.0"))
+VIDEO_SHIFT = float(os.environ.get("VIDEO_SHIFT", "8.0"))
+VIDEO_NEGATIVE = os.environ.get(
+    "VIDEO_NEGATIVE",
+    "blurry, low quality, distorted, watermark, text, static, still image")
+# Generous: a native-length clip is minutes of GPU time, and the model load is
+# paid on every job because ComfyUI runs with --cache-none.
+VIDEO_TIMEOUT = int(os.environ.get("VIDEO_TIMEOUT", "1800"))
+# Private video cannot be inlined the way a private image is -- base64 of an
+# MP4 would be megabytes of context on every subsequent turn. It is held in
+# gateway memory and served once from a URL that expires.
+PRIVATE_VIDEO_TTL = int(os.environ.get("PRIVATE_VIDEO_TTL", "600"))
+
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").rstrip("/")
 S3_BUCKET = os.environ.get("S3_BUCKET", "images")
 S3_KEY_ID = os.environ.get("S3_KEY_ID", "")
@@ -149,6 +182,7 @@ def capabilities() -> dict:
         "storage":  bool(S3_ENDPOINT and S3_KEY_ID and S3_SECRET),
         "generate": bool(COMFY_URL) and wf(WORKFLOW_GENERATE),
         "edit":     bool(COMFY_URL) and wf(WORKFLOW_EDIT),
+        "video":    bool(COMFY_URL) and VIDEO_ENABLED,
         # deleting needs both halves: the object store holds the image, the
         # index holds the row that makes it findable.
         "delete":   bool(S3_ENDPOINT and S3_KEY_ID and S3_SECRET

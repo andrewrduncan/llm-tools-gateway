@@ -9,7 +9,11 @@ from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
                      PUBLIC_URL, DEFAULT_TZ, WORKFLOW_DIR,
                      WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities,
                      PRIVATE_IMAGE_FORMAT, PRIVATE_IMAGE_QUALITY,
-                     COMFY_INPUT_DIR, COMFY_INPUT_TTL)
+                     COMFY_INPUT_DIR, COMFY_INPUT_TTL,
+                     VIDEO_ENABLED, VIDEO_UNET, VIDEO_CLIP, VIDEO_VAE,
+                     VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT, VIDEO_FPS,
+                     VIDEO_MAX_SECONDS, VIDEO_STEPS, VIDEO_CFG, VIDEO_SHIFT,
+                     VIDEO_NEGATIVE, VIDEO_TIMEOUT, PRIVATE_VIDEO_TTL)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
 # compose service name, or images render as broken links.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
@@ -164,15 +168,52 @@ DEFS = [
             "seed":        {"type": "integer"}},
             "required": ["instruction"]}}},
 ]
+
+if capabilities()["video"]:
+    DEFS.append(
+        {"type": "function", "function": {
+            "name": "generate_video",
+            "description": "Generate a SHORT video clip (max ~5 seconds) from a text "
+                           "description, optionally animating an existing image. Use when "
+                           "the user asks for a video, clip, animation, or asks to make a "
+                           "picture move. To animate an image already in this conversation "
+                           "- one they attached or you just generated - OMIT image_url and "
+                           "it is resolved automatically. NEVER invent a URL. "
+                           "This is SLOW (several minutes) and briefly evicts the chat "
+                           "model from memory, so do not call it speculatively - only when "
+                           "a video was actually asked for. It cannot produce clips longer "
+                           "than about 5 seconds; if more is wanted, say so rather than "
+                           "calling this repeatedly. Include the returned markdown verbatim.",
+            "parameters": {"type": "object", "properties": {
+                "prompt":    {"type": "string",
+                              "description": "What happens in the clip. Describe MOTION, not "
+                                             "just the scene - what moves, in which direction, "
+                                             "and how the camera behaves."},
+                "image_url": {"type": "string",
+                              "description": "Optional. Only for an image NOT in this "
+                                             "conversation. Omit it to animate the image "
+                                             "already here."},
+                "seconds":   {"type": "number",
+                              "description": "Clip length, 1-5. Default 5."},
+                "width":     {"type": "integer", "description": "Default 1280 (720p). Multiple of 32."},
+                "height":    {"type": "integer", "description": "Default 704. Multiple of 32."},
+                "seed":      {"type": "integer", "description": "Optional, for reproducibility."}},
+                "required": ["prompt"]}}})
+
 NAMES = {d["function"]["name"] for d in DEFS}
 
 # Tools whose caller identity must be injected server-side. The model must NEVER
 # be able to set `subject` -- otherwise it could read another user's memories.
 SUBJECT_TOOLS = {"remember", "recall", "forget", "search_documents",
-                 "search_images", "generate_image", "edit_image", "delete_image"}
+                 "search_images", "generate_image", "edit_image", "delete_image",
+                 "generate_video"}
 
 # Tools whose behaviour changes in a private turn: they must not persist.
-PRIVATE_AWARE_TOOLS = {"generate_image", "edit_image"}
+PRIVATE_AWARE_TOOLS = {"generate_image", "edit_image", "generate_video"}
+
+# Tools that may act on an image the model cannot address. Like `subject`, the
+# resolved image comes from the request, never from the model.
+CONVERSATION_IMAGE_TOOLS = {"edit_image", "generate_video"}
 
 # ---------------------------------------------------------------- helpers
 def _drop_edit_source(fname: str):
@@ -610,21 +651,244 @@ async def delete_image(image: str, subject=None):
                        "note": "The image is gone and its URL no longer resolves."})
 
 
+# ------------------------------------------------------------------ video
+# A private video cannot be inlined the way a private image is: base64 of an
+# MP4 is megabytes, and an inlined image is re-sent on EVERY later turn. So the
+# bytes stay in gateway memory and are served from a URL that expires.
+#
+# Not single-fetch, deliberately. The obvious "delete on first retrieval" rule
+# breaks playback: a browser issues a HEAD or a ranged GET before it plays, and
+# seeking issues more, so the first request is rarely the only one. Expiry is
+# the guarantee instead, and it still never touches a disk.
+_PRIVATE_VIDEOS: dict = {}
+
+
+def _private_video_put(raw: bytes, mime: str = "video/mp4") -> str:
+    import time as _t
+    now = _t.time()
+    for k, v in list(_PRIVATE_VIDEOS.items()):          # expire on write
+        if v[2] < now:
+            _PRIVATE_VIDEOS.pop(k, None)
+    tok = "".join(secrets.choice(_KEY_ALPHABET) for _ in range(20))
+    _PRIVATE_VIDEOS[tok] = (raw, mime, now + PRIVATE_VIDEO_TTL)
+    return tok
+
+
+def private_video_get(tok: str):
+    import time as _t
+    v = _PRIVATE_VIDEOS.get(tok)
+    if not v:
+        return None
+    if v[2] < _t.time():
+        _PRIVATE_VIDEOS.pop(tok, None)
+        return None
+    return v[0], v[1]
+
+
+def _video_frames(seconds: float) -> int:
+    """Frame count for a duration, snapped to the 4n+1 the model requires.
+
+    Wan22ImageToVideoLatent builds a latent of ((length-1)//4)+1 temporal
+    steps, so a length that is not 4n+1 silently loses the remainder.
+    """
+    n = int(round(float(seconds) * VIDEO_FPS))
+    n = max(1, (n - 1) // 4) * 4 + 1
+    return n
+
+
+async def _comfy_run_video(wf: dict, timeout: float):
+    """Queue a workflow, wait for it, and return (bytes, mime, error).
+
+    Video cannot use the websocket path the images take: there is no
+    SaveVideoWebsocket node, so SaveVideo writes a file and the gateway fetches
+    it back through /view and deletes it. The output directory is tmpfs, so
+    "writes a file" still means RAM, never disk.
+    """
+    import uuid as _uuid
+    cid = str(_uuid.uuid4())
+    async with httpx.AsyncClient(timeout=120) as c:
+        try:
+            r = await c.post(f"{COMFY}/prompt", json={"prompt": wf, "client_id": cid})
+            if r.status_code != 200:
+                return None, None, f"ComfyUI rejected the job: {r.text[:300]}"
+            pid = r.json()["prompt_id"]
+        except Exception as e:
+            return None, None, f"{type(e).__name__}: {e}"
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        entry = None
+        while loop.time() < deadline:
+            await asyncio.sleep(3)
+            try:
+                h = (await c.get(f"{COMFY}/history/{pid}")).json()
+            except Exception:
+                continue
+            if pid in h:
+                entry = h[pid]
+                break
+        if entry is None:
+            return None, None, f"timed out after {int(timeout)}s"
+
+        st = entry.get("status") or {}
+        if st.get("status_str") == "error":
+            return None, None, json.dumps(st.get("messages"))[:300]
+
+        # SaveVideo reports under "images" like the still nodes do, with an
+        # "animated" flag alongside. Take the first output that names a file.
+        meta = None
+        for node_out in (entry.get("outputs") or {}).values():
+            for f in (node_out.get("images") or node_out.get("videos") or []):
+                if f.get("filename"):
+                    meta = f
+                    break
+            if meta:
+                break
+        if not meta:
+            return None, None, "job finished but produced no video file"
+
+        try:
+            v = await c.get(f"{COMFY}/view", params={
+                "filename": meta["filename"],
+                "subfolder": meta.get("subfolder", ""),
+                "type": meta.get("type", "output")})
+            v.raise_for_status()
+            raw = v.content
+        except Exception as e:
+            return None, None, f"could not read the rendered video: {type(e).__name__}: {e}"
+        finally:
+            _drop_output_file(meta)
+        return raw, "video/mp4", None
+
+
+def _drop_output_file(meta: dict):
+    """Delete ComfyUI's rendered file once the gateway holds the bytes.
+
+    Best-effort and never fatal: the directory is tmpfs, so anything missed
+    dies at the next restart rather than accumulating on disk.
+    """
+    from .config import COMFY_OUTPUT_DIR
+    if not COMFY_OUTPUT_DIR:
+        return
+    try:
+        pth = os.path.join(COMFY_OUTPUT_DIR, meta.get("subfolder", ""), meta["filename"])
+        if os.path.commonpath([os.path.realpath(pth),
+                               os.path.realpath(COMFY_OUTPUT_DIR)]) == os.path.realpath(COMFY_OUTPUT_DIR):
+            os.remove(pth)
+    except Exception:
+        pass
+
+
+async def generate_video(prompt: str, image_url: str = None, seconds: float = None,
+                         width: int = None, height: int = None, seed: int = None,
+                         subject=None, private: bool = False,
+                         conversation_image: str = None) -> str:
+    """WAN 2.2 TI2V-5B. Text-to-video, or image-to-video when a source is given.
+
+    One model does both: Wan22ImageToVideoLatent takes an optional start_image
+    and rescales it itself, so "animate this picture" is the same graph with
+    one more node rather than a separate tool and a separate download.
+    """
+    w = max(256, min(int(width or VIDEO_MAX_WIDTH), VIDEO_MAX_WIDTH)) // 32 * 32
+    h = max(256, min(int(height or VIDEO_MAX_HEIGHT), VIDEO_MAX_HEIGHT)) // 32 * 32
+    secs = max(1.0, min(float(seconds or VIDEO_MAX_SECONDS), VIDEO_MAX_SECONDS))
+    frames = _video_frames(secs)
+    sd = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big")
+
+    start_ref = None
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        # Same rule as edit_image: a model asked to animate "this" cannot know
+        # the image's address, so any URL it supplies is invented unless the
+        # gateway handed it over earlier.
+        ref = image_url
+        if conversation_image and not (image_url or "").startswith((PUBLIC_URL, "data:")):
+            ref = conversation_image
+        if ref:
+            try:
+                src = base64.b64decode(ref.split(",", 1)[1]) if ref.startswith("data:") \
+                      else (await c.get(ref)).content
+                if len(src) < 500:
+                    return json.dumps({"error": f"source image invalid ({len(src)} bytes)"})
+                _sweep_edit_sources()
+                start_ref = await _comfy_upload(c, src, f"vid-src-{sd}.png")
+            except Exception as e:
+                return json.dumps({"error": f"could not read the source image: "
+                                            f"{type(e).__name__}: {e}"})
+
+    wf = {
+      "1":{"class_type":"UNETLoader","inputs":{"unet_name":VIDEO_UNET,"weight_dtype":"default"}},
+      "2":{"class_type":"CLIPLoader","inputs":{"clip_name":VIDEO_CLIP,"type":"wan"}},
+      "3":{"class_type":"VAELoader","inputs":{"vae_name":VIDEO_VAE}},
+      "4":{"class_type":"CLIPTextEncode","inputs":{"text":prompt,"clip":["2",0]}},
+      "5":{"class_type":"CLIPTextEncode","inputs":{"text":VIDEO_NEGATIVE,"clip":["2",0]}},
+      # TI2V-5B is a flow-matching model; without the shift the sampler produces
+      # mush. 8.0 is the value the reference template ships.
+      "6":{"class_type":"ModelSamplingSD3","inputs":{"model":["1",0],"shift":VIDEO_SHIFT}},
+      "7":{"class_type":"Wan22ImageToVideoLatent","inputs":{
+            "vae":["3",0],"width":w,"height":h,"length":frames,"batch_size":1}},
+      "8":{"class_type":"KSampler","inputs":{"seed":sd,"steps":VIDEO_STEPS,"cfg":VIDEO_CFG,
+            "sampler_name":"uni_pc","scheduler":"simple","denoise":1.0,
+            "model":["6",0],"positive":["4",0],"negative":["5",0],"latent_image":["7",0]}},
+      "9":{"class_type":"VAEDecode","inputs":{"samples":["8",0],"vae":["3",0]}},
+      "10":{"class_type":"CreateVideo","inputs":{"images":["9",0],"fps":VIDEO_FPS}},
+      # h264/mp4 rather than the default: it is the only combination every
+      # browser plays inline without a download prompt.
+      "11":{"class_type":"SaveVideo","inputs":{
+            "video":["10",0],"filename_prefix":"vid","format":"mp4","codec":"h264"}},
+    }
+    if start_ref:
+        wf["12"] = {"class_type":"LoadImage","inputs":{"image":start_ref}}
+        wf["7"]["inputs"]["start_image"] = ["12", 0]
+
+    raw, mime, err = await _comfy_run_video(wf, VIDEO_TIMEOUT)
+    if start_ref:
+        _drop_edit_source(start_ref.split(" [")[0])
+    if err:
+        return json.dumps({"error": "video generation failed", "detail": err})
+
+    dur = round((frames - 1) / VIDEO_FPS, 2)
+    if private:
+        tok = _private_video_put(raw, mime)
+        url = f"{PUBLIC_URL}/tmpvid/{tok}.mp4"
+        return json.dumps({
+            "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}",
+            "seconds": dur, "private": True,
+            "markdown": f"[video]({url})",
+            "note": f"Include the markdown field verbatim. This video was never "
+                    f"written to disk and the link stops working in "
+                    f"{PRIVATE_VIDEO_TTL // 60} minutes."})
+
+    try:
+        key = f"vid/{''.join(secrets.choice(_KEY_ALPHABET) for _ in range(16))}.mp4"
+        url = await s3.put(key, raw, "video/mp4")
+        await M.index_file(s3.BUCKET, key, url, "video/mp4", len(raw),
+                           prompt=prompt, subject=subject, source_file=None,
+                           image_b64=None)
+    except Exception as e:
+        return json.dumps({"error": "could not store the video",
+                           "detail": f"{type(e).__name__}: {e}"})
+    return json.dumps({
+        "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}", "seconds": dur,
+        "markdown": f"[video]({url})",
+        "note": "Include the markdown field verbatim in your reply to show the video."})
+
+
 DISPATCH = {"get_current_datetime": get_current_datetime, "web_search": web_search,
             "fetch_url": fetch_url, "browse_page": browse_page,
             "generate_image": generate_image, "edit_image": edit_image,
             "remember": remember, "recall": recall, "forget": forget,
             "search_documents": search_documents, "search_images": search_images,
-            "delete_image": delete_image}
+            "delete_image": delete_image, "generate_video": generate_video}
 
 # image generation legitimately takes ~40s+; the default 90s cap is too tight
-TIMEOUTS = {"generate_image": 330, "edit_image": 700}
+TIMEOUTS = {"generate_image": 330, "edit_image": 700,
+            "generate_video": VIDEO_TIMEOUT + 60}
 
 async def run(name: str, args: dict, subject=None, source=None, private=False,
               conversation_image=None):
     """Execute a server tool. Returns (text, optional_image_b64)."""
     fn = DISPATCH[name]
-    if name == "edit_image":
+    if name in CONVERSATION_IMAGE_TOOLS:
         # SECURITY/CORRECTNESS: like subject, this comes from the request. The
         # model cannot know the address of an image it was merely shown, so any
         # URL it supplies for one is a guess; the conversation's own image wins.
