@@ -973,7 +973,8 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
         return json.dumps({
             "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}",
             "seconds": dur, "private": True,
-            "markdown": f"[video]({url})",
+            "markdown": f'<video src="{url}" controls playsinline '
+                        f'style="max-width:100%"></video>\n\n[Download the clip]({url})',
             "note": f"Include the markdown field verbatim. This video was never "
                     f"written to disk and the link stops working in "
                     f"{PRIVATE_VIDEO_TTL // 60} minutes."})
@@ -989,7 +990,8 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
                            "detail": f"{type(e).__name__}: {e}"})
     return json.dumps({
         "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}", "seconds": dur,
-        "markdown": f"[video]({url})",
+        "markdown": f'<video src="{url}" controls playsinline '
+                    f'style="max-width:100%"></video>\n\n[Download the clip]({url})',
         "note": "Include the markdown field verbatim in your reply to show the video."})
 
 
