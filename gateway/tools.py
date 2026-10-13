@@ -973,8 +973,13 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
         return json.dumps({
             "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}",
             "seconds": dur, "private": True,
-            "markdown": f'<video src="{url}" controls playsinline '
-                        f'style="max-width:100%"></video>\n\n[Download the clip]({url})',
+            # The URL goes BETWEEN the tags, not in src=. Open WebUI matches
+            # /<video[^>]*>([\s\S]*?)<\/video>/ and takes capture group 1 as the
+            # source, so <video src="..."></video> has empty inner content and
+            # renders as literal text instead of a player. The link below is the
+            # fallback for clients that strip the tag entirely.
+            # URL between the tags, not src= -- see the note in the private branch.
+        "markdown": f"<video>{url}</video>\n\n[Download the clip]({url})",
             "note": f"Include the markdown field verbatim. This video was never "
                     f"written to disk and the link stops working in "
                     f"{PRIVATE_VIDEO_TTL // 60} minutes."})
@@ -990,8 +995,7 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
                            "detail": f"{type(e).__name__}: {e}"})
     return json.dumps({
         "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}", "seconds": dur,
-        "markdown": f'<video src="{url}" controls playsinline '
-                    f'style="max-width:100%"></video>\n\n[Download the clip]({url})',
+        "markdown": f"<video>{url}</video>\n\n[Download the clip]({url})",
         "note": "Include the markdown field verbatim in your reply to show the video."})
 
 
