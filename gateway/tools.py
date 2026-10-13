@@ -10,10 +10,16 @@ from .config import (SEARXNG_URL as SEARXNG, COMFY_URL as COMFY,
                      WORKFLOW_GENERATE, WORKFLOW_EDIT, capabilities,
                      PRIVATE_IMAGE_FORMAT, PRIVATE_IMAGE_QUALITY,
                      COMFY_INPUT_DIR, COMFY_INPUT_TTL,
-                     VIDEO_ENABLED, VIDEO_UNET, VIDEO_CLIP, VIDEO_VAE,
+                     VIDEO_ENABLED, VIDEO_VARIANT, VIDEO_CLIP, VIDEO_VAE,
+                     VIDEO_UNET_HIGH, VIDEO_UNET_LOW, VIDEO_LORA_HIGH,
+                     VIDEO_LORA_LOW, VIDEO_LORA_STRENGTH, VIDEO_SPLIT_PROMPTS,
                      VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT, VIDEO_FPS,
-                     VIDEO_MAX_SECONDS, VIDEO_DEFAULT_SECONDS, VIDEO_STEPS, VIDEO_CFG, VIDEO_SHIFT,
-                     VIDEO_NEGATIVE, VIDEO_TIMEOUT, PRIVATE_VIDEO_TTL)
+                     VIDEO_MAX_SECONDS, VIDEO_DEFAULT_SECONDS, VIDEO_STEPS,
+                     VIDEO_BOUNDARY, VIDEO_CFG, VIDEO_SHIFT, VIDEO_SAMPLER,
+                     VIDEO_SCHEDULER, VIDEO_NEGATIVE, VIDEO_TIMEOUT,
+                     VIDEO_I2V_UNET_HIGH, VIDEO_I2V_UNET_LOW,
+                     VIDEO_I2V_LORA_HIGH, VIDEO_I2V_LORA_LOW, VIDEO_I2V_ENABLED,
+                     PRIVATE_VIDEO_TTL)
 # URL the CLIENT's browser will use -- must be the LAN address, not the
 # compose service name, or images render as broken links.
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
@@ -170,6 +176,9 @@ DEFS = [
 ]
 
 if capabilities()["video"]:
+    # Appended rather than written inline because DEFS is otherwise static: the
+    # whole list sits in an identical prefix on every request so prefix caching
+    # makes it nearly free. A deployment without video simply never grows it.
     DEFS.append(
         {"type": "function", "function": {
             "name": "generate_video",
@@ -179,10 +188,13 @@ if capabilities()["video"]:
                            "picture move. To animate an image already in this conversation "
                            "- one they attached or you just generated - OMIT image_url and "
                            "it is resolved automatically. NEVER invent a URL. "
-                           f"This is SLOW - roughly 25 seconds of compute per second of "
-                           f"video - and it locks the GPU for the whole render, so image "
-                           f"generation and chat both stall behind it. Do NOT call it "
-                           f"speculatively; only when a video was actually asked for. It "
+                           f"This is VERY SLOW and cost grows far faster than length: about "
+                           f"a minute for a 2 second clip, but roughly twenty minutes for a "
+                           f"{int(VIDEO_MAX_SECONDS)} second one. It holds the GPU for the whole render, so "
+                           f"image generation and chat stall behind it. ALWAYS prefer the "
+                           f"shortest clip that satisfies the request, and leave `seconds` "
+                           f"unset unless the user asked for a specific length. Do NOT call "
+                           f"it speculatively; only when a video was actually asked for. It "
                            f"cannot produce clips longer than {int(VIDEO_MAX_SECONDS)} seconds; if more is "
                            f"wanted, say so rather than calling this repeatedly. "
                            f"Include the returned markdown verbatim.",
@@ -197,11 +209,13 @@ if capabilities()["video"]:
                                              "already here."},
                 "seconds":   {"type": "number",
                               "description": f"Clip length in seconds, 1-{int(VIDEO_MAX_SECONDS)}. "
-                                             f"Default {int(VIDEO_DEFAULT_SECONDS)}. Shorter is much faster."},
+                                             f"Default {int(VIDEO_DEFAULT_SECONDS)}. Each extra second "
+                                             f"costs disproportionately more; do not raise this "
+                                             f"without being asked."},
                 "width":     {"type": "integer",
-                              "description": f"Default {VIDEO_MAX_WIDTH}. Multiple of 32. Larger is not allowed."},
+                              "description": f"Default {VIDEO_MAX_WIDTH}. Multiple of 16. Larger is not allowed."},
                 "height":    {"type": "integer",
-                              "description": f"Default {VIDEO_MAX_HEIGHT}. Multiple of 32. Larger is not allowed."},
+                              "description": f"Default {VIDEO_MAX_HEIGHT}. Multiple of 16. Larger is not allowed."},
                 "seed":      {"type": "integer", "description": "Optional, for reproducibility."}},
                 "required": ["prompt"]}}})
 
@@ -691,78 +705,84 @@ def private_video_get(tok: str):
 
 
 def _video_frames(seconds: float) -> int:
-    """Frame count for a duration, snapped to the 4n+1 the model requires.
+    """Frame count for a duration, snapped to the 4n+1 the latent requires.
 
-    Wan22ImageToVideoLatent builds a latent of ((length-1)//4)+1 temporal
-    steps, so a length that is not 4n+1 silently loses the remainder.
+    A14B's own template derives length as floor(seconds * fps) + 1, which at
+    16fps already lands on 4n+1 for whole seconds. Fractional requests are
+    rounded to the nearest valid length rather than floored, so 5s is 81
+    frames and not 77.
     """
-    n = int(round(float(seconds) * VIDEO_FPS))
-    return max(1, int(round((n - 1) / 4))) * 4 + 1
+    n = int(float(seconds) * VIDEO_FPS) + 1
+    return max(5, int(round((n - 1) / 4)) * 4 + 1)
 
 
-async def _comfy_run_video(wf: dict, timeout: float):
-    """Queue a workflow, wait for it, and return (bytes, mime, error).
+async def _comfy_stage(c: httpx.AsyncClient, wf: dict, timeout: float):
+    """Queue one prompt and wait for it. Returns (outputs, error).
 
-    Video cannot use the websocket path the images take: there is no
-    SaveVideoWebsocket node, so SaveVideo writes a file and the gateway fetches
-    it back through /view and deletes it. The output directory is tmpfs, so
-    "writes a file" still means RAM, never disk.
+    Split out from the old single-shot helper because A14B runs as two jobs:
+    both 14B experts in one prompt OOM inside the fp8 dequantize kernel
+    regardless of free VRAM. See VIDEO_SPLIT_PROMPTS in config.
     """
     import uuid as _uuid
-    cid = str(_uuid.uuid4())
-    async with httpx.AsyncClient(timeout=120) as c:
+    try:
+        r = await c.post(f"{COMFY}/prompt",
+                         json={"prompt": wf, "client_id": str(_uuid.uuid4())})
+        if r.status_code != 200:
+            return None, f"ComfyUI rejected the job: {r.text[:300]}"
+        pid = r.json()["prompt_id"]
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        await asyncio.sleep(3)
         try:
-            r = await c.post(f"{COMFY}/prompt", json={"prompt": wf, "client_id": cid})
-            if r.status_code != 200:
-                return None, None, f"ComfyUI rejected the job: {r.text[:300]}"
-            pid = r.json()["prompt_id"]
-        except Exception as e:
-            return None, None, f"{type(e).__name__}: {e}"
+            h = (await c.get(f"{COMFY}/history/{pid}")).json()
+        except Exception:
+            continue
+        if pid in h:
+            entry = h[pid]
+            st = entry.get("status") or {}
+            if st.get("status_str") == "error":
+                return None, json.dumps(st.get("messages"))[:400]
+            return (entry.get("outputs") or {}), None
+    return None, f"timed out after {int(timeout)}s"
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        entry = None
-        while loop.time() < deadline:
-            await asyncio.sleep(3)
-            try:
-                h = (await c.get(f"{COMFY}/history/{pid}")).json()
-            except Exception:
-                continue
-            if pid in h:
-                entry = h[pid]
-                break
-        if entry is None:
-            return None, None, f"timed out after {int(timeout)}s"
 
-        st = entry.get("status") or {}
-        if st.get("status_str") == "error":
-            return None, None, json.dumps(st.get("messages"))[:300]
-
-        # SaveVideo reports under "images" like the still nodes do, with an
-        # "animated" flag alongside. Take the first output that names a file.
-        meta = None
-        for node_out in (entry.get("outputs") or {}).values():
-            for f in (node_out.get("images") or node_out.get("videos") or []):
+def _first_output(outputs: dict, *keys):
+    """First file an output node reported under any of `keys`."""
+    for node_out in (outputs or {}).values():
+        for k in keys:
+            for f in (node_out.get(k) or []):
                 if f.get("filename"):
-                    meta = f
-                    break
-            if meta:
-                break
-        if not meta:
-            return None, None, "job finished but produced no video file"
+                    return f
+    return None
 
-        try:
-            v = await c.get(f"{COMFY}/view", params={
-                "filename": meta["filename"],
-                "subfolder": meta.get("subfolder", ""),
-                "type": meta.get("type", "output")})
-            v.raise_for_status()
-            raw = v.content
-        except Exception as e:
-            return None, None, f"could not read the rendered video: {type(e).__name__}: {e}"
-        finally:
-            _drop_output_file(meta)
-        return raw, "video/mp4", None
+
+def _wan_expert(expert: str, i2v: bool) -> dict:
+    """Loader -> Lightning LoRA -> ModelSamplingSD3 chain for one expert."""
+    if i2v:
+        unet = VIDEO_I2V_UNET_HIGH if expert == "high" else VIDEO_I2V_UNET_LOW
+        lora = VIDEO_I2V_LORA_HIGH if expert == "high" else VIDEO_I2V_LORA_LOW
+    else:
+        unet = VIDEO_UNET_HIGH if expert == "high" else VIDEO_UNET_LOW
+        lora = VIDEO_LORA_HIGH if expert == "high" else VIDEO_LORA_LOW
+    return {
+      "u":  {"class_type": "UNETLoader",
+             "inputs": {"unet_name": unet, "weight_dtype": "default"}},
+      # LoraLoaderModelOnly, not LoraLoader: the Lightning LoRAs carry no text
+      # encoder weights, and the CLIP-aware loader errors on them.
+      "ld": {"class_type": "LoraLoaderModelOnly",
+             "inputs": {"lora_name": lora, "strength_model": VIDEO_LORA_STRENGTH,
+                        "model": ["u", 0]}},
+      # WAN is flow-matching; without the shift the sampler returns mush.
+      "ms": {"class_type": "ModelSamplingSD3",
+             "inputs": {"shift": VIDEO_SHIFT, "model": ["ld", 0]}},
+      "clip": {"class_type": "CLIPLoader",
+               "inputs": {"clip_name": VIDEO_CLIP, "type": "wan"}},
+      "vae": {"class_type": "VAELoader", "inputs": {"vae_name": VIDEO_VAE}},
+    }
 
 
 def _drop_output_file(meta: dict):
@@ -787,17 +807,25 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
                          width: int = None, height: int = None, seed: int = None,
                          subject=None, private: bool = False,
                          conversation_image: str = None) -> str:
-    """WAN 2.2 TI2V-5B. Text-to-video, or image-to-video when a source is given.
+    """WAN 2.2 A14B. Text-to-video, or image-to-video when a source is given.
 
-    One model does both: Wan22ImageToVideoLatent takes an optional start_image
-    and rescales it itself, so "animate this picture" is the same graph with
-    one more node rather than a separate tool and a separate download.
+    Runs as TWO queued ComfyUI prompts, not one. A14B is a mixture of experts:
+    a high-noise expert lays down structure and motion over the first half of
+    the steps, a low-noise expert refines detail over the second. Loading both
+    in a single prompt dies in the fp8 dequantize kernel with an out-of-memory
+    error that has nothing to do with free VRAM, so stage one writes its latent
+    to ComfyUI's output directory and stage two picks it up from there. That
+    directory is tmpfs and shared with this container, so the handoff never
+    touches disk and needs no copy: LoadLatent resolves a "<name> [output]"
+    annotation directly.
     """
-    w = max(256, min(int(width or VIDEO_MAX_WIDTH), VIDEO_MAX_WIDTH)) // 32 * 32
-    h = max(256, min(int(height or VIDEO_MAX_HEIGHT), VIDEO_MAX_HEIGHT)) // 32 * 32
+    w = max(256, min(int(width or VIDEO_MAX_WIDTH), VIDEO_MAX_WIDTH)) // 16 * 16
+    h = max(256, min(int(height or VIDEO_MAX_HEIGHT), VIDEO_MAX_HEIGHT)) // 16 * 16
     secs = max(1.0, min(float(seconds or VIDEO_DEFAULT_SECONDS), VIDEO_MAX_SECONDS))
     frames = _video_frames(secs)
     sd = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big")
+    steps = max(2, VIDEO_STEPS)
+    bound = max(1, min(VIDEO_BOUNDARY, steps - 1))
 
     start_ref = None
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
@@ -807,6 +835,10 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
         ref = image_url
         if conversation_image and not (image_url or "").startswith((PUBLIC_URL, "data:")):
             ref = conversation_image
+        if ref and not VIDEO_I2V_ENABLED:
+            return json.dumps({"error": "image-to-video is not enabled on this "
+                                        "deployment; describe the scene in the "
+                                        "prompt instead"})
         if ref:
             try:
                 src = base64.b64decode(ref.split(",", 1)[1]) if ref.startswith("data:") \
@@ -819,40 +851,124 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
                 return json.dumps({"error": f"could not read the source image: "
                                             f"{type(e).__name__}: {e}"})
 
-    wf = {
-      "1":{"class_type":"UNETLoader","inputs":{"unet_name":VIDEO_UNET,"weight_dtype":"default"}},
-      "2":{"class_type":"CLIPLoader","inputs":{"clip_name":VIDEO_CLIP,"type":"wan"}},
-      "3":{"class_type":"VAELoader","inputs":{"vae_name":VIDEO_VAE}},
-      "4":{"class_type":"CLIPTextEncode","inputs":{"text":prompt,"clip":["2",0]}},
-      "5":{"class_type":"CLIPTextEncode","inputs":{"text":VIDEO_NEGATIVE,"clip":["2",0]}},
-      # TI2V-5B is a flow-matching model; without the shift the sampler produces
-      # mush. 8.0 is the value the reference template ships.
-      "6":{"class_type":"ModelSamplingSD3","inputs":{"model":["1",0],"shift":VIDEO_SHIFT}},
-      "7":{"class_type":"Wan22ImageToVideoLatent","inputs":{
-            "vae":["3",0],"width":w,"height":h,"length":frames,"batch_size":1}},
-      "8":{"class_type":"KSampler","inputs":{"seed":sd,"steps":VIDEO_STEPS,"cfg":VIDEO_CFG,
-            "sampler_name":"uni_pc","scheduler":"simple","denoise":1.0,
-            "model":["6",0],"positive":["4",0],"negative":["5",0],"latent_image":["7",0]}},
-      "9":{"class_type":"VAEDecode","inputs":{"samples":["8",0],"vae":["3",0]}},
-      "10":{"class_type":"CreateVideo","inputs":{"images":["9",0],"fps":VIDEO_FPS}},
-      # h264/mp4 rather than the default: it is the only combination every
-      # browser plays inline without a download prompt.
-      "11":{"class_type":"SaveVideo","inputs":{
-            "video":["10",0],"filename_prefix":"vid","format":"mp4","codec":"h264"}},
-    }
-    if start_ref:
-        wf["12"] = {"class_type":"LoadImage","inputs":{"image":start_ref}}
-        wf["7"]["inputs"]["start_image"] = ["12", 0]
+        i2v = bool(start_ref)
+        # VIDEO_TIMEOUT budgets the WHOLE render, not each half. Two stages each
+        # given the full value would let a job run to twice the configured cap
+        # and outlive the dispatch timeout in run().
+        _loop = asyncio.get_running_loop()
+        _deadline = _loop.time() + VIDEO_TIMEOUT
+        def _left():
+            return max(30.0, _deadline - _loop.time())
+        # random, not seed- or time-derived: two concurrent calls must not
+        # collide on the handoff latent, and a repeated seed is legitimate
+        tag = "vid-" + "".join(secrets.choice(_KEY_ALPHABET) for _ in range(12))
 
-    raw, mime, err = await _comfy_run_video(wf, VIDEO_TIMEOUT)
-    if start_ref:
-        _drop_edit_source(start_ref.split(" [")[0])
-    if err:
-        return json.dumps({"error": "video generation failed", "detail": err})
+        def conditioning(g: dict) -> tuple:
+            """Text encode, plus the image conditioning i2v needs.
+
+            WanImageToVideo rewrites BOTH conditionings and emits the latent, so
+            an i2v graph cannot simply reuse the text encodes. Stage two rebuilds
+            it for its own conditioning and then discards its latent in favour of
+            the one stage one saved.
+            """
+            g["pos"] = {"class_type": "CLIPTextEncode",
+                        "inputs": {"text": prompt, "clip": ["clip", 0]}}
+            g["neg"] = {"class_type": "CLIPTextEncode",
+                        "inputs": {"text": VIDEO_NEGATIVE, "clip": ["clip", 0]}}
+            if not i2v:
+                g["lat"] = {"class_type": "EmptyHunyuanLatentVideo",
+                            "inputs": {"width": w, "height": h,
+                                       "length": frames, "batch_size": 1}}
+                return ["pos", 0], ["neg", 0], ["lat", 0]
+            g["img"] = {"class_type": "LoadImage", "inputs": {"image": start_ref}}
+            g["i2v"] = {"class_type": "WanImageToVideo",
+                        "inputs": {"width": w, "height": h, "length": frames,
+                                   "batch_size": 1, "positive": ["pos", 0],
+                                   "negative": ["neg", 0], "vae": ["vae", 0],
+                                   "start_image": ["img", 0]}}
+            return ["i2v", 0], ["i2v", 1], ["i2v", 2]
+
+        # ---- stage 1: high-noise expert, steps 0..bound --------------------
+        g1 = _wan_expert("high", i2v)
+        p1, n1, l1 = conditioning(g1)
+        g1["ks"] = {"class_type": "KSamplerAdvanced", "inputs": {
+            "add_noise": "enable", "noise_seed": sd, "steps": steps,
+            "cfg": VIDEO_CFG, "sampler_name": VIDEO_SAMPLER,
+            "scheduler": VIDEO_SCHEDULER, "start_at_step": 0,
+            "end_at_step": bound,
+            # the low-noise expert finishes the schedule, so the partially
+            # denoised latent must keep its remaining noise
+            "return_with_leftover_noise": "enable",
+            "model": ["ms", 0], "positive": p1, "negative": n1, "latent_image": l1}}
+        g1["sv"] = {"class_type": "SaveLatent",
+                    "inputs": {"filename_prefix": f"vidlat/{tag}", "samples": ["ks", 0]}}
+
+        outs, err = await _comfy_stage(c, g1, _left())
+        if err:
+            if start_ref:
+                _drop_edit_source(start_ref.split(" [")[0])
+            return json.dumps({"error": "video generation failed in the motion "
+                                        "pass", "detail": err})
+        lat = _first_output(outs, "latents")
+        if not lat:
+            if start_ref:
+                _drop_edit_source(start_ref.split(" [")[0])
+            return json.dumps({"error": "the motion pass produced no latent"})
+
+        # LoadLatent reads from the INPUT directory unless the name carries an
+        # annotation; "[output]" points it at the shared tmpfs instead, so the
+        # latent never has to be copied anywhere.
+        latname = os.path.join(lat.get("subfolder", ""), lat["filename"])
+
+        # ---- stage 2: low-noise expert, steps bound..steps -----------------
+        g2 = _wan_expert("low", i2v)
+        p2, n2, _ = conditioning(g2)
+        g2["ll"] = {"class_type": "LoadLatent",
+                    "inputs": {"latent": f"{latname} [output]"}}
+        g2["ks"] = {"class_type": "KSamplerAdvanced", "inputs": {
+            "add_noise": "disable", "noise_seed": 0, "steps": steps,
+            "cfg": VIDEO_CFG, "sampler_name": VIDEO_SAMPLER,
+            "scheduler": VIDEO_SCHEDULER, "start_at_step": bound,
+            "end_at_step": steps, "return_with_leftover_noise": "disable",
+            "model": ["ms", 0], "positive": p2, "negative": n2,
+            "latent_image": ["ll", 0]}}
+        g2["dec"] = {"class_type": "VAEDecode",
+                     "inputs": {"samples": ["ks", 0], "vae": ["vae", 0]}}
+        g2["cv"] = {"class_type": "CreateVideo",
+                    "inputs": {"images": ["dec", 0], "fps": VIDEO_FPS}}
+        # h264/mp4 rather than the default: it is the only combination every
+        # browser plays inline without a download prompt.
+        g2["sav"] = {"class_type": "SaveVideo", "inputs": {
+            "video": ["cv", 0], "filename_prefix": "vid",
+            "format": "mp4", "codec": "h264"}}
+
+        outs2, err2 = await _comfy_stage(c, g2, _left())
+        _drop_output_file(lat)                     # the latent is scratch
+        if start_ref:
+            _drop_edit_source(start_ref.split(" [")[0])
+        if err2:
+            return json.dumps({"error": "video generation failed in the detail "
+                                        "pass", "detail": err2})
+        meta = _first_output(outs2, "images", "videos")
+        if not meta:
+            return json.dumps({"error": "the detail pass produced no video file"})
+
+        try:
+            v = await c.get(f"{COMFY}/view", params={
+                "filename": meta["filename"],
+                "subfolder": meta.get("subfolder", ""),
+                "type": meta.get("type", "output")})
+            v.raise_for_status()
+            raw = v.content
+        except Exception as e:
+            return json.dumps({"error": "could not read the rendered video",
+                               "detail": f"{type(e).__name__}: {e}"})
+        finally:
+            _drop_output_file(meta)
 
     dur = round((frames - 1) / VIDEO_FPS, 2)
     if private:
-        tok = _private_video_put(raw, mime)
+        tok = _private_video_put(raw, "video/mp4")
         url = f"{PUBLIC_URL}/tmpvid/{tok}.mp4"
         return json.dumps({
             "status": "ok", "url": url, "seed": sd, "size": f"{w}x{h}",

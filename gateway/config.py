@@ -67,61 +67,105 @@ COMFY_INPUT_DIR = os.environ.get("COMFY_INPUT_DIR", "")
 # Safety net for sources orphaned by a crash between upload and cleanup.
 COMFY_INPUT_TTL = int(os.environ.get("COMFY_INPUT_TTL", "900"))
 
-# ---- Video generation (WAN 2.2 TI2V-5B) -----------------------------------
+# ---- Video generation (WAN 2.2 A14B, MoE) ---------------------------------
 # Off unless a deployment opts in. Unlike the image tools, this one cannot be
 # gated by a file the gateway can see: the weights live in ComfyUI's models
 # directory, which the gateway does not mount. An explicit flag is the honest
 # gate -- a tool that is advertised but whose weights are absent fails at call
 # time, which is exactly what "tools degrade, never break" forbids.
 VIDEO_ENABLED = _b("VIDEO_ENABLED", "0")
-VIDEO_UNET = os.environ.get("VIDEO_UNET", "wan2.2_ti2v_5B_fp16.safetensors")
+
+# A14B, not TI2V-5B. The 5B model is documented as 720P-ONLY, and running it
+# below that is not "lower quality" -- it is out of distribution and returns
+# incoherent output (measured: green striping, no subject, at 640x352). Its
+# native 1280x704 could not finish a 5s clip in 40 minutes on this hardware, so
+# there is no setting at which 5B is both correct and affordable here.
+#
+# A14B is trained for 480P and 720P, so 832x480 is IN distribution, and it is
+# the only WAN 2.2 variant with 4-step Lightning LoRAs. Measured side by side at
+# 480x480/33f/seed 12345, 5B produced noise and A14B produced a photorealistic,
+# temporally stable clip.
+#
+# A14B is a mixture of experts: a high-noise expert lays down structure and
+# MOTION, a low-noise expert refines detail. Both are needed -- with only the
+# low-noise expert the scene is correct but nearly static (measured: a boat that
+# does not travel). See VIDEO_SPLIT_PROMPTS for why they run as two jobs.
+VIDEO_VARIANT = os.environ.get("VIDEO_VARIANT", "t2v")       # t2v | i2v
+VIDEO_UNET_HIGH = os.environ.get(
+    "VIDEO_UNET_HIGH", "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors")
+VIDEO_UNET_LOW = os.environ.get(
+    "VIDEO_UNET_LOW", "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors")
+# The t2v Lightning LoRAs are v1.1 and the i2v ones v1; the names are not
+# symmetric, so neither can be derived from the other.
+VIDEO_LORA_HIGH = os.environ.get(
+    "VIDEO_LORA_HIGH", "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors")
+VIDEO_LORA_LOW = os.environ.get(
+    "VIDEO_LORA_LOW", "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors")
+VIDEO_LORA_STRENGTH = float(os.environ.get("VIDEO_LORA_STRENGTH", "1.0"))
+# Animating a supplied image needs the i2v weights: the t2v model has no image
+# conditioning at all, so feeding it a start frame is not a degraded result,
+# it is the wrong graph. A deployment that has only the t2v pair leaves these
+# empty and the tool stops advertising the image parameter.
+VIDEO_I2V_UNET_HIGH = os.environ.get(
+    "VIDEO_I2V_UNET_HIGH", "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors")
+VIDEO_I2V_UNET_LOW = os.environ.get(
+    "VIDEO_I2V_UNET_LOW", "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors")
+VIDEO_I2V_LORA_HIGH = os.environ.get(
+    "VIDEO_I2V_LORA_HIGH", "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors")
+VIDEO_I2V_LORA_LOW = os.environ.get(
+    "VIDEO_I2V_LORA_LOW", "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors")
+VIDEO_I2V_ENABLED = _b("VIDEO_I2V_ENABLED", "1")
 VIDEO_CLIP = os.environ.get("VIDEO_CLIP", "umt5_xxl_fp8_e4m3fn_scaled.safetensors")
-VIDEO_VAE = os.environ.get("VIDEO_VAE", "wan2.2_vae.safetensors")
-# MEASURED on gfx1151, wall clock, including the ~20-90s model load that every
-# job pays because ComfyUI runs with --cache-none:
-#   640x352  2s   8 steps ->  0m48   (24s per second of video)
-#   640x352 10s   8 steps ->  5m21   (32s per second -- scaling is superlinear)
-#   832x480  2s  20 steps ->  2m39
-#   832x480  3s  20 steps ->  5m18
-#   1280x704 2s  20 steps ->  >7m   (killed; did not finish a TWO second clip)
-#   1280x704 5s  20 steps ->  >13m  (killed, unfinished)
-# Cost scales with pixels x frames x steps, and throughput FALLS as the clip
-# grows (attention is superlinear), so the three multiply worse than linearly.
+# A14B uses the Wan 2.1 VAE. Only TI2V-5B uses wan2.2_vae, and crossing them
+# fails at runtime rather than degrading.
+VIDEO_VAE = os.environ.get("VIDEO_VAE", "wan_2.1_vae.safetensors")
+
+# Loading both 14B experts in ONE ComfyUI prompt reliably dies with
+#   RuntimeError: HIP kernel launch failed: out of memory
+# raised inside the fp8 dequantize kernel. This is NOT capacity: it reproduces
+# with 95GB of 96GB free, with --reserve-vram lowered to 4, and at a latent as
+# small as 480x480x33. ComfyUI stages both quantized models (13.6GB each) and
+# never unloads the first. Running the experts as two queued prompts forces a
+# teardown between them and costs ~6s.
+VIDEO_SPLIT_PROMPTS = _b("VIDEO_SPLIT_PROMPTS", "1")
+
+# MEASURED on gfx1151 (Strix Halo, 96GB VRAM), wall clock, full MoE, 4 steps:
+#   480x480  33f (2s)   ->  0m79   (both experts, incl. teardown)
+#   832x480  81f (5s)   -> ~20m    (stage 1 alone was 9m42)
+# Cost is dominated by CLIP LENGTH, not resolution: 4.3x the pixel-frames cost
+# ~16x the time, because attention is quadratic in token count. Shortening a
+# clip buys far more than shrinking it.
 #
-# Defaults are 360p/8 steps, which is the 0m48 row above -- roughly 24s of
-# compute per second of video. The other rows are what 480p and 720p cost.
-#
-# The caps are 360p rather than the model's native 720p for one reason
-# that is not about patience: a queued job cannot be cancelled. ComfyUI only
-# checks for an interrupt between sampler steps, so a long job is uninterruptible
-# in practice, and the only way out is restarting the container -- which has
-# already taken the LLM's Vulkan context down with it once. A 4-minute worst
-# case is recoverable. A 16-minute one holds the whole box hostage.
-#
-# 720p is NOT viable at 20 steps -- it could not finish a 2s clip in 7 minutes,
-# so the model's own native 1280x704 is out of reach on this hardware by the
-# step count alone. Raise these only once the WAN Lightning LoRAs are in: 4
-# steps instead of 20 is a 5x cut and is what would make 720p reachable.
-VIDEO_MAX_WIDTH = int(os.environ.get("VIDEO_MAX_WIDTH", "640"))
-VIDEO_MAX_HEIGHT = int(os.environ.get("VIDEO_MAX_HEIGHT", "352"))
-VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "24"))
-VIDEO_MAX_SECONDS = float(os.environ.get("VIDEO_MAX_SECONDS", "10"))
-# Default shorter than the cap. Defaulting to the maximum would make every
-# unqualified "make me a video" the slowest possible job.
-VIDEO_DEFAULT_SECONDS = float(os.environ.get("VIDEO_DEFAULT_SECONDS", "5"))
-VIDEO_STEPS = int(os.environ.get("VIDEO_STEPS", "8"))
-VIDEO_CFG = float(os.environ.get("VIDEO_CFG", "5.0"))
-VIDEO_SHIFT = float(os.environ.get("VIDEO_SHIFT", "8.0"))
+# 832x480 is WAN's native 480P widescreen. Do not raise the cap to 720p without
+# measuring -- at this scaling it is hours, not minutes.
+VIDEO_MAX_WIDTH = int(os.environ.get("VIDEO_MAX_WIDTH", "832"))
+VIDEO_MAX_HEIGHT = int(os.environ.get("VIDEO_MAX_HEIGHT", "480"))
+# A14B runs at 16fps, NOT the 24 that TI2V-5B uses. Its own template derives
+# length as floor(seconds * fps) + 1, which lands on the 4n+1 the latent needs.
+VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "16"))
+VIDEO_MAX_SECONDS = float(os.environ.get("VIDEO_MAX_SECONDS", "5"))
+# Default well under the cap. Defaulting to the maximum would make every
+# unqualified "make me a video" a ~20 minute job instead of a ~1 minute one.
+VIDEO_DEFAULT_SECONDS = float(os.environ.get("VIDEO_DEFAULT_SECONDS", "2"))
+# 4 steps split evenly between the experts, and cfg 1.0 -- these are not tuning
+# knobs. The Lightning LoRAs are step-distilled: they are TRAINED for 4 steps at
+# cfg 1, and raising either degrades output rather than improving it.
+VIDEO_STEPS = int(os.environ.get("VIDEO_STEPS", "4"))
+VIDEO_BOUNDARY = int(os.environ.get("VIDEO_BOUNDARY", "2"))
+VIDEO_CFG = float(os.environ.get("VIDEO_CFG", "1.0"))
+VIDEO_SHIFT = float(os.environ.get("VIDEO_SHIFT", "5.0"))
+VIDEO_SAMPLER = os.environ.get("VIDEO_SAMPLER", "euler")
+VIDEO_SCHEDULER = os.environ.get("VIDEO_SCHEDULER", "simple")
 VIDEO_NEGATIVE = os.environ.get(
     "VIDEO_NEGATIVE",
     "blurry, low quality, distorted, watermark, text, static, still image")
-# Generous: a native-length clip is minutes of GPU time, and the model load is
-# paid on every job because ComfyUI runs with --cache-none.
-VIDEO_TIMEOUT = int(os.environ.get("VIDEO_TIMEOUT", "600"))
+# A 5s clip is ~20 minutes of GPU. The gateway streams progress heartbeats, so
+# the client connection survives; this only bounds the wait.
+VIDEO_TIMEOUT = int(os.environ.get("VIDEO_TIMEOUT", "2400"))
 # Private video cannot be inlined the way a private image is -- base64 of an
 # MP4 would be megabytes of context on every subsequent turn. It is held in
-# gateway memory and served once from a URL that expires.
-PRIVATE_VIDEO_TTL = int(os.environ.get("PRIVATE_VIDEO_TTL", "600"))
+# gateway memory and served from a URL that expires.
+PRIVATE_VIDEO_TTL = int(os.environ.get("PRIVATE_VIDEO_TTL", "1800"))
 
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").rstrip("/")
 S3_BUCKET = os.environ.get("S3_BUCKET", "images")
