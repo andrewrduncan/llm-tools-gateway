@@ -785,6 +785,41 @@ def _wan_expert(expert: str, i2v: bool) -> dict:
     }
 
 
+def _sweep_video_outputs():
+    """Reap rendered videos and handoff latents a previous call left behind.
+
+    A cancelled request (the user closing the chat mid-render) now leaves its
+    file rather than deleting it, because a finished clip is worth far more
+    than the RAM it occupies -- the directory is tmpfs, so an orphan costs
+    memory, not disk, and clears on restart regardless. This bounds that.
+
+    Deliberately generous: anything younger than the timeout could still belong
+    to a job in flight, and deleting that is the bug this exists to avoid.
+    """
+    import time as _t
+    # local import, matching _drop_output_file: COMFY_OUTPUT_DIR is not in this
+    # module's top-level import list, and referencing it without this raises
+    # NameError on every video call
+    from .config import COMFY_OUTPUT_DIR
+    if not COMFY_OUTPUT_DIR:
+        return
+    cutoff = _t.time() - max(VIDEO_TIMEOUT * 2, 3600)
+    try:
+        root = os.path.realpath(COMFY_OUTPUT_DIR)
+        for sub, _dirs, files in os.walk(root):
+            for fn in files:
+                if not fn.endswith((".mp4", ".latent", ".webm")):
+                    continue
+                pth = os.path.join(sub, fn)
+                try:
+                    if os.path.getmtime(pth) < cutoff:
+                        os.remove(pth)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def _drop_output_file(meta: dict):
     """Delete ComfyUI's rendered file once the gateway holds the bytes.
 
@@ -826,6 +861,8 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
     sd = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big")
     steps = max(2, VIDEO_STEPS)
     bound = max(1, min(VIDEO_BOUNDARY, steps - 1))
+
+    _sweep_video_outputs()
 
     start_ref = None
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
@@ -961,10 +998,17 @@ async def generate_video(prompt: str, image_url: str = None, seconds: float = No
             v.raise_for_status()
             raw = v.content
         except Exception as e:
+            # Deliberately leave the file: a render costs minutes of GPU and the
+            # output directory is tmpfs, so an orphan is cheap and recoverable
+            # while a deleted one is not. _sweep_video_outputs() reaps it later.
             return json.dumps({"error": "could not read the rendered video",
                                "detail": f"{type(e).__name__}: {e}"})
-        finally:
-            _drop_output_file(meta)
+        # NOT a finally. A finally also runs when the client disconnects --
+        # asyncio.CancelledError is a BaseException, so it sails past
+        # `except Exception` but still triggers cleanup on the way out, which
+        # destroyed a finished 5s clip that had cost 20 minutes of GPU. Delete
+        # only once the bytes are actually in hand.
+        _drop_output_file(meta)
 
     dur = round((frames - 1) / VIDEO_FPS, 2)
     if private:
