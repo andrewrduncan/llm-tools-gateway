@@ -164,6 +164,57 @@ def strip_history_images(messages, keep=1):
     return removed
 
 
+# The shape attach_inline() emits. Matched in history, not in fresh output.
+_HISTORY_INLINE_IMAGE = re.compile(
+    r"!\[[^\]]*\]\(\s*(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+?)\s*\)")
+
+
+def hoist_inline_images(messages):
+    """Move private images out of assistant text and into attachments.
+
+    A private image comes back as a data URI inside the reply text, because it
+    has no URL by design. The client then re-sends that text on every later
+    turn, where it is no longer an image but ~60k tokens of base64 -- two of
+    them overflowed a 64k context. As an image_url part the vision encoder
+    reads it for ~1k tokens, strip_history_images() can trim it, and
+    newest_conversation_image() can find it, so "edit it again" edits the
+    latest result rather than the original upload.
+
+    Each image moves to the front of the next user message: user content is
+    the one place every OpenAI-compatible server accepts images. Returns the
+    number hoisted.
+    """
+    hoisted = 0
+    i = 0
+    while i < len(messages or []):
+        m = messages[i]
+        content = m.get("content")
+        if m.get("role") != "assistant" or not isinstance(content, str):
+            i += 1
+            continue
+        uris = _HISTORY_INLINE_IMAGE.findall(content)
+        if not uris:
+            i += 1
+            continue
+        m["content"] = _HISTORY_INLINE_IMAGE.sub(
+            "[image -- attached to the next message]", content)
+        parts = [{"type": "text", "text": "Image from your previous reply:"}]
+        parts += [{"type": "image_url", "image_url": {"url": re.sub(r"\s", "", u)}}
+                  for u in uris]
+        nxt = next((j for j in range(i + 1, len(messages))
+                    if messages[j].get("role") == "user"), None)
+        if nxt is None:
+            messages.insert(i + 1, {"role": "user", "content": parts})
+        else:
+            existing = messages[nxt].get("content")
+            if isinstance(existing, str):
+                existing = [{"type": "text", "text": existing}] if existing else []
+            messages[nxt]["content"] = parts + list(existing or [])
+        hoisted += len(uris)
+        i += 1
+    return hoisted
+
+
 def is_private(body) -> bool:
     """Should this turn leave no trace?
 
@@ -232,6 +283,34 @@ def merge_tools(client_tools, private=False):
             if not (private and d["function"]["name"] in PRIVATE_DISABLED_TOOLS)]
     return list(client_tools or []) + [d for d in ours
                                        if d["function"]["name"] not in names]
+
+
+class UpstreamError(Exception):
+    """The model server refused the request; carries the reason it gave."""
+
+    def __init__(self, status, raw):
+        super().__init__(f"upstream {status}")
+        self.status, self.raw = status, raw or ""
+
+
+def upstream_error_text(status, raw):
+    """What to tell the user when the model server refuses a turn.
+
+    Without this a refused request streams an empty reply, and the client shows
+    nothing at all -- indistinguishable from a turn that is still running.
+    """
+    msg = None
+    try:
+        err = json.loads(raw).get("error")
+        msg = err.get("message") if isinstance(err, dict) else err
+    except Exception:
+        pass
+    msg = str(msg or raw[:300] or "no reason given")
+    text = f"\u26A0\uFE0F The model server could not complete this request (HTTP {status}): {msg}"
+    if "context" in msg.lower():
+        text += ("\n\nThis conversation no longer fits in the model's context "
+                 "window. Start a new chat to continue.")
+    return text
 
 
 async def call_upstream(client, body):
@@ -317,6 +396,10 @@ def drop_anti_loop(body):
 async def chat(request: Request):
     body = await request.json()
     subject, source = identify(request)
+    # Before stripping: hoisted images are what the strip counts and trims.
+    n = hoist_inline_images(body.get("messages"))
+    if n:
+        log.info("hoisted %d inline image(s) from history into attachments", n)
     if STRIP_HISTORY_IMAGES:
         n = strip_history_images(body.get("messages"), KEEP_RECENT_IMAGES)
         if n:
@@ -469,34 +552,41 @@ async def chat(request: Request):
 
     # ---------------------------------------------------------- non-streaming
     if not stream:
-        async with httpx.AsyncClient() as client:
-            for _ in range(MAX_ROUNDS):
+        try:
+            async with httpx.AsyncClient() as client:
+                for _ in range(MAX_ROUNDS):
+                    body["messages"] = messages
+                    data = await call_upstream(client, body)
+                    msg = data["choices"][0]["message"]
+                    tcs = msg.get("tool_calls") or []
+                    if not mine_only(tcs):
+                        if not tcs:
+                            m0 = data["choices"][0]["message"]
+                            if turn_images:
+                                m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
+                            if inline_images:
+                                m0["content"] = attach_inline(m0.get("content"), inline_images)
+                        return JSONResponse(data)
+                    await apply(msg, tcs)
                 body["messages"] = messages
+                body["tool_choice"] = "none"
                 data = await call_upstream(client, body)
-                msg = data["choices"][0]["message"]
-                tcs = msg.get("tool_calls") or []
-                if not mine_only(tcs):
-                    if not tcs:
-                        m0 = data["choices"][0]["message"]
-                        if turn_images:
-                            m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
-                        if inline_images:
-                            m0["content"] = attach_inline(m0.get("content"), inline_images)
-                    return JSONResponse(data)
-                await apply(msg, tcs)
-            body["messages"] = messages
-            body["tool_choice"] = "none"
-            data = await call_upstream(client, body)
-            m0 = data["choices"][0]["message"]
-            if turn_images:
-                m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
-            if inline_images:
-                m0["content"] = attach_inline(m0.get("content"), inline_images)
-            return JSONResponse(data)
+                m0 = data["choices"][0]["message"]
+                if turn_images:
+                    m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
+                if inline_images:
+                    m0["content"] = attach_inline(m0.get("content"), inline_images)
+                return JSONResponse(data)
+        except httpx.HTTPStatusError as e:
+            log.warning("upstream refused turn: HTTP %s", e.response.status_code)
+            return Response(content=e.response.content,
+                            status_code=e.response.status_code,
+                            media_type=e.response.headers.get("content-type"))
 
     # ---------------------------------------------------------- streaming
+    cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+
     async def gen():
-        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         usage_total = {}
         yield sse(chunk(cid, model, {"role": "assistant", "content": ""}))
         async with httpx.AsyncClient() as client:
@@ -516,6 +606,9 @@ async def chat(request: Request):
                 async with client.stream("POST", f"{UPSTREAM}/v1/chat/completions",
                                          json=body,
                                          timeout=httpx.Timeout(600.0)) as r:
+                    if r.status_code >= 400:
+                        raise UpstreamError(r.status_code,
+                                            (await r.aread()).decode(errors="replace"))
                     async for line in r.aiter_lines():
                         if not line.startswith("data: "):
                             continue
@@ -599,7 +692,26 @@ async def chat(request: Request):
             yield sse(chunk(cid, model, {}, finish="stop"))
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    async def guarded():
+        """Turn an upstream failure into a visible reply instead of silence."""
+        try:
+            async for piece in gen():
+                yield piece
+        except (UpstreamError, httpx.HTTPError) as e:
+            if isinstance(e, UpstreamError):
+                status, raw = e.status, e.raw
+            else:
+                status, raw = 502, f"could not reach the model server ({type(e).__name__})"
+            text = upstream_error_text(status, raw)
+            # The reason is the server's, not the user's prompt, but a private
+            # turn still logs nothing beyond the status.
+            log.warning("upstream refused turn: HTTP %s%s", status,
+                        "" if private else f" -- {raw[:200]}")
+            yield sse(chunk(cid, model, {"content": text}))
+            yield sse(chunk(cid, model, {}, finish="stop"))
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(guarded(), media_type="text/event-stream")
 
 
 @app.get("/img/{key:path}")
