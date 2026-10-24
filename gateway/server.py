@@ -23,7 +23,9 @@ from .config import (UPSTREAM, KEYS_FILE, PROGRESS, MAX_TOOL_ROUNDS as MAX_ROUND
                      DRY_MULTIPLIER, DRY_PENALTY_LAST_N as DRY_LAST_N,
                      PRIVATE_CHAT_ID_PREFIXES, PRIVATE_MODEL_SUFFIX,
                      PRIVATE_TWIN_MODELS, PRIVATE_DISABLED_TOOLS,
-                     STRIP_HISTORY_IMAGES, KEEP_RECENT_IMAGES)
+                     STRIP_HISTORY_IMAGES, KEEP_RECENT_IMAGES,
+                     CODER_URL, CODING_CHAT_MODEL, CODING_DISABLED_TOOLS)
+from .coding import MODE, ModeBusy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -271,16 +273,17 @@ def as_image(img, tool_name):
     return image_label(tool_name), b64, mime
 
 
-def merge_tools(client_tools, private=False):
+def merge_tools(client_tools, private=False, coding=False):
     """Client tools win on name collision; ours are appended.
 
-    In a private turn the persistence tools are not offered at all. Withholding
-    them beats instructing the model not to use them: it cannot call what it
-    cannot see.
+    In a private turn the persistence tools are not offered at all, and while
+    coding the GPU-heavy ones are not. Withholding them beats instructing the
+    model not to use them: it cannot call what it cannot see.
     """
     names = {t.get("function", {}).get("name") for t in (client_tools or [])}
-    ours = [d for d in T.DEFS
-            if not (private and d["function"]["name"] in PRIVATE_DISABLED_TOOLS)]
+    withheld = ((PRIVATE_DISABLED_TOOLS if private else set())
+                | (CODING_DISABLED_TOOLS if coding else set()))
+    ours = [d for d in T.DEFS if d["function"]["name"] not in withheld]
     return list(client_tools or []) + [d for d in ours
                                        if d["function"]["name"] not in names]
 
@@ -416,6 +419,12 @@ async def chat(request: Request):
     if (private and PRIVATE_MODEL_SUFFIX
             and str(body.get("model") or "").endswith(PRIVATE_MODEL_SUFFIX)):
         body["model"] = body["model"][:-len(PRIVATE_MODEL_SUFFIX)]
+    # While coding, every chat-side request goes to the small model. Bookkeeping
+    # calls included: one request naming the big model would load it beside the
+    # coder and overcommit the GPU.
+    coding_turn = MODE.coding
+    if coding_turn:
+        body["model"] = CODING_CHAT_MODEL
     if private:
         log.info("PRIVATE turn [subject=%s chat_id=%s] -- no storage, no memory tools",
                  subject, body.get("chat_id")
@@ -439,7 +448,7 @@ async def chat(request: Request):
     stream = bool(body.pop("stream", False))
     want_usage = bool((body.pop("stream_options", None) or {}).get("include_usage"))
     client_tools = body.get("tools")
-    body["tools"] = merge_tools(client_tools, private=private)
+    body["tools"] = merge_tools(client_tools, private=private, coding=coding_turn)
     if not body.get("tool_choice"):
         body["tool_choice"] = "auto"
     if is_internal_task(body.get("messages")):
@@ -566,6 +575,8 @@ async def chat(request: Request):
                                 m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
                             if inline_images:
                                 m0["content"] = attach_inline(m0.get("content"), inline_images)
+                            if coding_turn:
+                                m0["content"] = MODE.note() + (m0.get("content") or "")
                         return JSONResponse(data)
                     await apply(msg, tcs)
                 body["messages"] = messages
@@ -576,6 +587,8 @@ async def chat(request: Request):
                     m0["content"] = repair_image_urls(m0.get("content") or "", turn_images)
                 if inline_images:
                     m0["content"] = attach_inline(m0.get("content"), inline_images)
+                if coding_turn:
+                    m0["content"] = MODE.note() + (m0.get("content") or "")
                 return JSONResponse(data)
         except httpx.HTTPStatusError as e:
             log.warning("upstream refused turn: HTTP %s", e.response.status_code)
@@ -589,6 +602,8 @@ async def chat(request: Request):
     async def gen():
         usage_total = {}
         yield sse(chunk(cid, model, {"role": "assistant", "content": ""}))
+        if coding_turn:
+            yield sse(chunk(cid, model, {"content": MODE.note()}))
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_ROUNDS):
                 body["messages"] = messages
@@ -764,6 +779,82 @@ async def admin_index(request: Request):
                                   subject=b.get("subject"))
 
 
+@app.on_event("startup")
+async def start_mode_manager():
+    if MODE.enabled:
+        asyncio.create_task(MODE.run())
+
+
+@app.get("/admin/mode")
+async def get_mode():
+    """Which configuration the GPU is in, and what is loaded where."""
+    return await MODE.status()
+
+
+@app.post("/admin/mode")
+async def set_mode(request: Request):
+    """Switch by hand: {"mode": "code"} or {"mode": "chat"}."""
+    want = ((await request.json()) or {}).get("mode")
+    try:
+        await MODE.switch(want)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except ModeBusy as e:
+        return JSONResponse({"error": str(e), **(await MODE.status())}, status_code=503)
+    return await MODE.status()
+
+
+@app.api_route("/coder/{path:path}", methods=["GET", "POST"])
+async def coder_door(path: str, request: Request):
+    """The coding client's entry point: a raw passthrough to the coder.
+
+    No tools, no sampling changes, no history rewriting -- an agentic client
+    brings its own tools and needs the model's output verbatim. What this door
+    adds is ordering: a POST first puts the GPU in coding mode, and does not
+    reach the coder until the chat model has been confirmed unloaded.
+    """
+    if not MODE.enabled:
+        return JSONResponse({"error": {"message": "Coding mode is not configured on this gateway.",
+                                       "type": "not_configured"}}, status_code=404)
+    raw = await request.body()
+    is_work = request.method == "POST"
+    if is_work:
+        try:
+            await MODE.enter_coding("coding client connected")
+        except ModeBusy as e:
+            return JSONResponse({"error": {"message": str(e), "type": "unavailable",
+                                           "code": 503}}, status_code=503)
+        MODE.begin()
+    client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0))
+    try:
+        r = await client.send(client.build_request(
+            request.method, f"{CODER_URL}/{path}", content=raw,
+            params=request.query_params,
+            headers={k: v for k, v in request.headers.items()
+                     if k.lower() not in ("host", "content-length")}), stream=True)
+    except httpx.HTTPError as e:
+        await client.aclose()
+        if is_work:
+            MODE.end()
+        return JSONResponse({"error": {"message": f"Could not reach the coder ({type(e).__name__}).",
+                                       "type": "unavailable", "code": 502}}, status_code=502)
+
+    async def relay():
+        # Closing the upstream when the client goes away is what stops the
+        # coder generating into the void.
+        try:
+            async for piece in r.aiter_raw():
+                yield piece
+        finally:
+            await r.aclose()
+            await client.aclose()
+            if is_work:
+                MODE.end()
+
+    return StreamingResponse(relay(), status_code=r.status_code,
+                             media_type=r.headers.get("content-type"))
+
+
 @app.get("/v1/models")
 async def models(request: Request):
     """Advertise a "-private" twin of every upstream model.
@@ -798,10 +889,19 @@ async def models(request: Request):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def passthrough(path: str, request: Request):
     """Everything else (/v1/models, /metrics, ...) goes straight to vLLM."""
+    raw = await request.body()
+    if MODE.coding and request.method == "POST" and raw:
+        try:
+            b = json.loads(raw)
+            if isinstance(b, dict) and b.get("model"):
+                b["model"] = CODING_CHAT_MODEL
+                raw = json.dumps(b).encode()
+        except ValueError:
+            pass
     async with httpx.AsyncClient() as client:
         r = await client.request(
             request.method, f"{UPSTREAM}/{path}",
-            content=await request.body(),
+            content=raw,
             headers={k: v for k, v in request.headers.items()
                      if k.lower() not in ("host", "content-length")},
             params=request.query_params, timeout=httpx.Timeout(600.0))
