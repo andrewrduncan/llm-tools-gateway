@@ -250,8 +250,10 @@ class ModeManager:
 
     async def status(self):
         async def safe(base):
+            # "id" when loaded, "id (loading)" while it is still coming up.
             try:
-                return await _resident(base)
+                return [i if st == "loaded" else f"{i} ({st})"
+                        for i, st in await _models(base) if st not in ("unloaded", "?")]
             except Exception as e:
                 return f"unreachable ({type(e).__name__})"
         idle = time.time() - self.last_activity
