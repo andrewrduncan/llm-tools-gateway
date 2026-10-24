@@ -1,7 +1,7 @@
 ---
 title: Log
 type: index
-updated: 2026-10-07
+updated: 2026-10-24
 ---
 
 # Log
@@ -76,3 +76,17 @@ locally. New page: [ci-pipeline](entities/ci-pipeline.md). Added a root
 
 **Still open:** `workflow.load()` is never called, so the mounted workflow JSON
 files are decorative and the README's "export your own and drop it in" is untrue.
+
+## [2026-10-23] fix | private images in history, silent upstream refusals
+Private images return as data URIs in reply text; re-sent each turn they were
+~60k tokens apiece, and two edits overflowed a 64k context (128,827 tokens,
+HTTP 400). `hoist_inline_images()` now moves them into image_url parts on the
+next user message: the same conversation measured 2,158 tokens. A refused
+turn previously streamed an empty reply; it now streams the reason.
+
+## [2026-10-24] change | coding mode
+A coder behind `/coder/v1` plus a small chat model, swapped in for the strong
+chat model on demand; image and video tools withheld while coding. Measured
+79.6 GB in coding mode vs 40.1 GB in chat, 26 s to switch in, 18 s back. The
+coder's prefix caching works (190k context, 19 new tokens in 1.5 s). New page:
+[coding-mode](concepts/coding-mode.md).

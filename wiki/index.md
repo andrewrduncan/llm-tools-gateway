@@ -1,7 +1,7 @@
 ---
 title: Index
 type: index
-updated: 2026-10-07
+updated: 2026-10-24
 ---
 
 # Index
@@ -26,6 +26,7 @@ updated: 2026-10-07
 - [private-mode](concepts/private-mode.md) — turns that leave nothing behind
 - [verbatim-vs-anti-loop](concepts/verbatim-vs-anti-loop.md) — DRY corrupts quoted tool output
 - [context-cost-of-images](concepts/context-cost-of-images.md) — why history images are stripped
+- [coding-mode](concepts/coding-mode.md) — coder + small chat model, and the ordered switch
 
 ## Analyses
 - [engine-choice](analyses/engine-choice.md) — vLLM vs llama.cpp, with measurements
