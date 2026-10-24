@@ -226,6 +226,36 @@ PRIVATE_DISABLED_TOOLS = {t.strip() for t in os.environ.get(
 PRIVATE_IMAGE_FORMAT = os.environ.get("PRIVATE_IMAGE_FORMAT", "JPEG").upper()
 PRIVATE_IMAGE_QUALITY = int(os.environ.get("PRIVATE_IMAGE_QUALITY", "80"))
 
+# ---- coding mode ----------------------------------------------------------
+# A coding model and the everyday chat model together can outgrow the GPU. So
+# the gateway runs one of two configurations and owns the switch between them:
+#
+#   chat    the strong chat model; image and video tools available
+#   coding  the coder, plus a small chat model alongside it; image and video
+#           tools withheld, because their peak would overcommit the GPU
+#
+# The coder sits behind its own model server, reachable only through
+# /coder/v1 here. That door is a raw passthrough -- no tools, no sampling
+# changes -- but it is the gateway's door, so the coder can never start
+# loading before the chat model has left. A client talking to the coder's
+# server directly would skip that ordering, which is why it is not published.
+#
+# Empty CODER_URL turns the whole feature off.
+CODER_URL = os.environ.get("CODER_URL", "").rstrip("/")
+CODER_MODEL = os.environ.get("CODER_MODEL", "")
+# What chat requests are answered by while coding. Every chat-side request is
+# rewritten to it -- including client bookkeeping calls -- because a single
+# request for the big model would swap it back in next to the coder.
+CODING_CHAT_MODEL = os.environ.get("CODING_CHAT_MODEL", "")
+# Loaded in the background when coding ends, so the first chat afterwards does
+# not wait for it. Empty = load on demand.
+CHAT_PRELOAD_MODEL = os.environ.get("CHAT_PRELOAD_MODEL", "")
+# Coding ends on its own after this long with no coder traffic.
+CODING_IDLE_MINUTES = float(os.environ.get("CODING_IDLE_MINUTES", "30"))
+CODING_DISABLED_TOOLS = {t.strip() for t in os.environ.get(
+    "CODING_DISABLED_TOOLS", "generate_image,edit_image,generate_video"
+).split(",") if t.strip()}
+
 DEFAULT_TZ = os.environ.get("DEFAULT_TZ", "UTC")
 PLAYWRIGHT = _b("ENABLE_BROWSER", "1")
 
