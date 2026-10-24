@@ -105,6 +105,17 @@ generation never looks like a hang:
 `reasoning_content` is *rendered* by clients but never *executed* — unlike real
 `tool_calls`, which a coding agent would try to run and fail on.
 
+## Coding mode (optional)
+
+When a coding model and your chat model will not fit on the GPU together, set
+`CODER_URL` (a second model server, unpublished), `CODER_MODEL` and
+`CODING_CHAT_MODEL`. Point the coding client at `/coder/v1` on the gateway: its
+first request unloads the chat model, then passes straight through to the coder.
+Chat keeps working on the small model, with image and video tools withheld, until
+`CODING_IDLE_MINUTES` pass without coding or you `POST /admin/mode {"mode": "chat"}`.
+`GET /admin/mode` shows what is loaded. See
+[`wiki/concepts/coding-mode.md`](wiki/concepts/coding-mode.md).
+
 ## ComfyUI workflows are yours
 
 Image workflows are JSON in `workflows/`, not baked into the code, because node
